@@ -181,7 +181,7 @@ fn incomingServer(
     while (shouldWait(5)) {
         var from_addr: std.posix.sockaddr = undefined;
         var from_addr_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr);
-        const conn = std.posix.accept(socket, &from_addr, &from_addr_len, 0) catch |err| {
+        const incoming_socket = std.posix.accept(socket, &from_addr, &from_addr_len, 0) catch |err| {
             switch (err) {
                 error.WouldBlock => continue,
                 else => return,
@@ -191,15 +191,15 @@ fn incomingServer(
         log.debug("new connection to incoming server: {any}", .{from_addr_p});
 
         var buf: [4096]u8 = [_]u8{0} ** 4096;
-        const n = try std.posix.read(conn, &buf);
+        const n = try std.posix.read(incoming_socket, &buf);
         log.debug("was read {d} bytes from connection: {any}", .{ n, from_addr_p });
         req_ch.send(ProxyRequest{ .data = buf[0..n] });
         log.debug("request was sent through channel for connection: {any}", .{from_addr_p});
         if (res_ch.receive()) |data| {
             log.debug("response was received through channel for connection: {any}", .{from_addr_p});
-            _ = try std.posix.write(conn, data.data);
+            _ = try std.posix.write(incoming_socket, data.data);
         }
-        std.posix.close(conn);
+        std.posix.close(incoming_socket);
     }
 
     log.info("incoming tcp server was stopped by os signal", .{});
@@ -216,11 +216,11 @@ fn proxyServer(
     log.info("starting proxy tcp server on {any}", .{port});
 
     wait_connection: while (shouldWait(5)) {
-        var conn: std.posix.socket_t = undefined;
+        var client_socket: std.posix.socket_t = undefined;
         var from_addr: std.posix.sockaddr = undefined;
         var from_addr_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr);
         while (shouldWait(5)) {
-            conn = std.posix.accept(socket, &from_addr, &from_addr_len, 0) catch |err| {
+            client_socket = std.posix.accept(socket, &from_addr, &from_addr_len, 0) catch |err| {
                 switch (err) {
                     error.WouldBlock => continue,
                     else => return,
@@ -231,16 +231,16 @@ fn proxyServer(
             log.info("tcp server was stopped by os signal", .{});
             return;
         }
-        defer std.posix.close(conn);
+        defer std.posix.close(client_socket);
         log.info("new connection is established: {any}", .{from_addr});
 
         wait_data: while (shouldWait(5)) {
             const request = req_ch.receive();
             if (request) |req| {
-                _ = try std.posix.write(conn, req.data);
+                _ = try std.posix.write(client_socket, req.data);
                 var buf: [1024]u8 = [_]u8{0} ** 1024;
                 while (shouldWait(5)) {
-                    const n = std.posix.read(conn, &buf) catch |err| {
+                    const n = std.posix.read(client_socket, &buf) catch |err| {
                         switch (err) {
                             error.WouldBlock => continue,
                             else => return,
@@ -263,15 +263,15 @@ fn proxyServer(
 }
 
 fn connectToProxyServer() !void {
-    const socket = try initSocket();
-    defer std.posix.close(socket);
+    const proxy_socket = try initSocket();
+    defer std.posix.close(proxy_socket);
     // Connect to the proxy server.
-    try connect(socket, "172.17.0.3", 22000);
+    try connect(proxy_socket, "172.17.0.3", 22000);
     log.info("connected to the proxy server", .{});
 
     var buf: [1024]u8 = [_]u8{0} ** 1024;
     while (shouldWait(5)) {
-        const n = std.posix.read(socket, &buf) catch |err| {
+        const proxy_n = std.posix.read(proxy_socket, &buf) catch |err| {
             switch (err) {
                 error.WouldBlock => continue,
                 else => {
@@ -280,13 +280,13 @@ fn connectToProxyServer() !void {
                 },
             }
         };
-        log.debug("read {d} bytes from proxy server", .{n});
+        log.debug("read {d} bytes from proxy server", .{proxy_n});
 
         const target_socket = try initSocket();
         defer std.posix.close(target_socket);
         try connect(target_socket, "172.17.0.2", 44000);
 
-        _ = try std.posix.write(target_socket, buf[0..n]);
+        _ = try std.posix.write(target_socket, buf[0..proxy_n]);
         while (shouldWait(5)) {
             const target_n = std.posix.read(target_socket, &buf) catch |err| {
                 switch (err) {
@@ -294,7 +294,7 @@ fn connectToProxyServer() !void {
                     else => return,
                 }
             };
-            _ = try std.posix.write(socket, buf[0..target_n]);
+            _ = try std.posix.write(proxy_socket, buf[0..target_n]);
             // We need to exit from this loop as we already read and send data.
             break;
         }
