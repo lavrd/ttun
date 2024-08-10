@@ -105,6 +105,10 @@ fn handleSignal(
     log.debug("os signal received: {d}", .{signal});
     wait_signal_mutex.lock();
     defer wait_signal_mutex.unlock();
+    if (!wait_signal) {
+        log.err("received signal second time, exit immediately", .{});
+        std.process.exit(1);
+    }
     wait_signal = false;
     wait_signal_cond.broadcast();
 }
@@ -250,7 +254,8 @@ fn proxyServer(
             return;
         }
         defer std.posix.close(client_socket);
-        log.info("new connection is established: {any}", .{from_addr});
+        const from_addr_p = try parseSockaddr(from_addr);
+        log.info("new connection is established: {any}", .{from_addr_p});
 
         var buf: [1024]u8 = [_]u8{0} ** 1024;
         while (shouldWait(5)) {
