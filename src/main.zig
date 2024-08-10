@@ -60,6 +60,14 @@ fn Channel(comptime T: type) type {
             self._cond.signal();
         }
 
+        fn try_receive(
+            self: *Self,
+        ) ?T {
+            self._mutex.lock();
+            defer self._mutex.unlock();
+            return self._change();
+        }
+
         fn receive(self: *Self) ?T {
             self._mutex.lock();
             defer self._mutex.unlock();
@@ -181,7 +189,12 @@ fn incomingServer(
     while (shouldWait(5)) {
         var from_addr: std.posix.sockaddr = undefined;
         var from_addr_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr);
-        const incoming_socket = std.posix.accept(socket, &from_addr, &from_addr_len, 0) catch |err| {
+        const incoming_socket = std.posix.accept(
+            socket,
+            &from_addr,
+            &from_addr_len,
+            std.posix.SOCK.NONBLOCK,
+        ) catch |err| {
             switch (err) {
                 error.WouldBlock => continue,
                 else => return,
@@ -220,7 +233,12 @@ fn proxyServer(
         var from_addr: std.posix.sockaddr = undefined;
         var from_addr_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr);
         while (shouldWait(5)) {
-            client_socket = std.posix.accept(socket, &from_addr, &from_addr_len, 0) catch |err| {
+            client_socket = std.posix.accept(
+                socket,
+                &from_addr,
+                &from_addr_len,
+                std.posix.SOCK.NONBLOCK,
+            ) catch |err| {
                 switch (err) {
                     error.WouldBlock => continue,
                     else => return,
@@ -234,28 +252,24 @@ fn proxyServer(
         defer std.posix.close(client_socket);
         log.info("new connection is established: {any}", .{from_addr});
 
-        wait_data: while (shouldWait(5)) {
-            const request = req_ch.receive();
-            if (request) |req| {
-                _ = try std.posix.write(client_socket, req.data);
-                var buf: [1024]u8 = [_]u8{0} ** 1024;
-                while (shouldWait(5)) {
-                    const n = std.posix.read(client_socket, &buf) catch |err| {
-                        switch (err) {
-                            error.WouldBlock => continue,
-                            else => return,
+        var buf: [1024]u8 = [_]u8{0} ** 1024;
+        while (shouldWait(5)) {
+            const n = std.posix.read(client_socket, &buf) catch |err| {
+                switch (err) {
+                    error.WouldBlock => {
+                        if (req_ch.try_receive()) |req| {
+                            _ = try std.posix.write(client_socket, req.data);
                         }
-                    };
-                    if (n == 0) {
-                        log.info("tcp connection closed", .{});
-                        continue :wait_connection;
-                    }
-                    res_ch.send(ProxyResponse{ .data = buf[0..n] });
-                    continue :wait_data;
+                        continue;
+                    },
+                    else => return,
                 }
+            };
+            if (n == 0) {
+                log.info("tcp connection closed", .{});
+                continue :wait_connection;
             }
-            // It means channels were closed.
-            continue :wait_connection;
+            res_ch.send(ProxyResponse{ .data = buf[0..n] });
         }
     }
 
@@ -280,6 +294,10 @@ fn connectToProxyServer() !void {
                 },
             }
         };
+        if (proxy_n == 0) {
+            log.info("tcp connection with proxy server closed", .{});
+            return;
+        }
         log.debug("read {d} bytes from proxy server", .{proxy_n});
 
         const target_socket = try initSocket();
