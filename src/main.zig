@@ -24,6 +24,11 @@ const Config = struct {
     side: Side,
 };
 
+const Address = struct {
+    port: u16,
+    ipv4: [4]u8,
+};
+
 const ProxyRequest = struct {
     data: []u8,
 };
@@ -168,33 +173,33 @@ fn incomingServer(
     req_ch: *Channel(ProxyRequest),
     res_ch: *Channel(ProxyResponse),
 ) !void {
-    const address = std.net.Address.parseIp("0.0.0.0", port) catch unreachable;
-    var tcp_server = try address.listen(.{
-        .reuse_address = true,
-        .force_nonblocking = true,
-    });
-    defer tcp_server.deinit();
-    log.info("starting incoming tcp server on {any}", .{address});
+    const socket = try initSocket();
+    defer std.posix.close(socket);
+    try listen(socket, "0.0.0.0", port);
+    log.info("starting incoming tcp server on {any}", .{port});
 
     while (shouldWait(5)) {
-        const conn = tcp_server.accept() catch |err| {
+        var from_addr: std.posix.sockaddr = undefined;
+        var from_addr_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr);
+        const conn = std.posix.accept(socket, &from_addr, &from_addr_len, 0) catch |err| {
             switch (err) {
                 error.WouldBlock => continue,
                 else => return,
             }
         };
-        log.debug("new connection to incoming server: {any}", .{conn.address});
+        const from_addr_p = try parseSockaddr(from_addr);
+        log.debug("new connection to incoming server: {any}", .{from_addr_p});
 
         var buf: [4096]u8 = [_]u8{0} ** 4096;
-        const n = try conn.stream.read(&buf);
-        log.debug("was read {d} bytes from connection: {any}", .{ n, conn.address });
+        const n = try std.posix.read(conn, &buf);
+        log.debug("was read {d} bytes from connection: {any}", .{ n, from_addr_p });
         req_ch.send(ProxyRequest{ .data = buf[0..n] });
-        log.debug("request was sent through channel for connection: {any}", .{conn.address});
+        log.debug("request was sent through channel for connection: {any}", .{from_addr_p});
         if (res_ch.receive()) |data| {
-            log.debug("response was received through channel for connection: {any}", .{conn.address});
-            try conn.stream.writeAll(data.data);
+            log.debug("response was received through channel for connection: {any}", .{from_addr_p});
+            _ = try std.posix.write(conn, data.data);
         }
-        conn.stream.close();
+        std.posix.close(conn);
     }
 
     log.info("incoming tcp server was stopped by os signal", .{});
@@ -205,18 +210,17 @@ fn proxyServer(
     req_ch: *Channel(ProxyRequest),
     res_ch: *Channel(ProxyResponse),
 ) !void {
-    const address = std.net.Address.parseIp("0.0.0.0", port) catch unreachable;
-    var tcp_server = try address.listen(.{
-        .reuse_address = true,
-        .force_nonblocking = true,
-    });
-    defer tcp_server.deinit();
-    log.info("starting proxy tcp server on {any}", .{address});
+    const socket = try initSocket();
+    defer std.posix.close(socket);
+    try listen(socket, "0.0.0.0", port);
+    log.info("starting proxy tcp server on {any}", .{port});
 
     wait_connection: while (shouldWait(5)) {
-        var conn: std.net.Server.Connection = undefined;
+        var conn: std.posix.socket_t = undefined;
+        var from_addr: std.posix.sockaddr = undefined;
+        var from_addr_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr);
         while (shouldWait(5)) {
-            conn = tcp_server.accept() catch |err| {
+            conn = std.posix.accept(socket, &from_addr, &from_addr_len, 0) catch |err| {
                 switch (err) {
                     error.WouldBlock => continue,
                     else => return,
@@ -227,16 +231,16 @@ fn proxyServer(
             log.info("tcp server was stopped by os signal", .{});
             return;
         }
-        defer conn.stream.close();
-        log.info("new connection is established: {any}", .{conn.address});
+        defer std.posix.close(conn);
+        log.info("new connection is established: {any}", .{from_addr});
 
         wait_data: while (shouldWait(5)) {
             const request = req_ch.receive();
             if (request) |req| {
-                try conn.stream.writeAll(req.data);
+                _ = try std.posix.write(conn, req.data);
                 var buf: [1024]u8 = [_]u8{0} ** 1024;
                 while (shouldWait(5)) {
-                    const n = conn.stream.read(&buf) catch |err| {
+                    const n = std.posix.read(conn, &buf) catch |err| {
                         switch (err) {
                             error.WouldBlock => continue,
                             else => return,
@@ -259,26 +263,11 @@ fn proxyServer(
 }
 
 fn connectToProxyServer() !void {
-    // We do not use std.net because client cannot be non-blocking.
-    // That's why we are using raw socket.
-    // Create and open the socket.
-    const socket = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+    const socket = try initSocket();
     defer std.posix.close(socket);
-    // Make socket work in non-blocking mode.
-    const flags = try std.posix.fcntl(socket, std.posix.F.GETFL, 0);
-    _ = try std.posix.fcntl(socket, std.posix.F.SETFL, flags | std.posix.SOCK.NONBLOCK);
     // Connect to the proxy server.
-    const address = try std.net.Address.parseIp4("172.17.0.3", 22000);
-    std.posix.connect(socket, &address.any, address.getOsSockLen()) catch |err| {
-        switch (err) {
-            error.WouldBlock => {},
-            else => {
-                log.err("failed to connect to proxy server: {any}", .{err});
-                return;
-            },
-        }
-    };
-    log.info("connected to the proxy server: {any}", .{address});
+    try connect(socket, "172.17.0.3", 22000);
+    log.info("connected to the proxy server", .{});
 
     var buf: [1024]u8 = [_]u8{0} ** 1024;
     while (shouldWait(5)) {
@@ -293,13 +282,13 @@ fn connectToProxyServer() !void {
         };
         log.debug("read {d} bytes from proxy server", .{n});
 
-        const target_address = try std.net.Address.parseIp4("172.17.0.2", 44000);
-        const target_conn = try std.net.tcpConnectToAddress(target_address);
-        defer target_conn.close();
-        try target_conn.writeAll(buf[0..n]);
+        const target_socket = try initSocket();
+        defer std.posix.close(target_socket);
+        try connect(target_socket, "172.17.0.2", 44000);
 
+        _ = try std.posix.write(target_socket, buf[0..n]);
         while (shouldWait(5)) {
-            const target_n = target_conn.read(&buf) catch |err| {
+            const target_n = std.posix.read(target_socket, &buf) catch |err| {
                 switch (err) {
                     error.WouldBlock => continue,
                     else => return,
@@ -350,6 +339,59 @@ fn parseConfig(allocator: std.mem.Allocator) !Config {
         return config.value;
     }
     return error.NoArgWithConfig;
+}
+
+fn initSocket() !std.posix.socket_t {
+    // We do not use std.net because client cannot be non-blocking.
+    // That's why we are using raw socket.
+    // Create and open the socket.
+    const socket = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+    // Make socket work in non-blocking mode.
+    const flags = try std.posix.fcntl(socket, std.posix.F.GETFL, 0);
+    _ = try std.posix.fcntl(socket, std.posix.F.SETFL, flags | std.posix.SOCK.NONBLOCK);
+    return socket;
+}
+
+fn listen(socket: std.posix.socket_t, raw_address: []const u8, port: u16) !void {
+    // Reuse address and port.
+    try std.posix.setsockopt(
+        socket,
+        std.posix.SOL.SOCKET,
+        std.posix.SO.REUSEADDR | std.posix.SO.REUSEPORT,
+        &std.mem.toBytes(@as(c_int, 1)),
+    );
+    // Bind to address to be able to start listening on it.
+    const address = try std.net.Address.parseIp4(raw_address, port);
+    try std.posix.bind(socket, &address.any, address.getOsSockLen());
+    try std.posix.listen(socket, 1);
+}
+
+fn connect(socket: std.posix.socket_t, raw_address: []const u8, port: u16) !void {
+    const address = try std.net.Address.parseIp4(raw_address, port);
+    std.posix.connect(socket, &address.any, address.getOsSockLen()) catch |err| {
+        switch (err) {
+            error.WouldBlock => log.debug("would block on connection to {any}", .{address}),
+            else => {
+                log.err("failed to connect to proxy server: {any}", .{err});
+                return;
+            },
+        }
+    };
+}
+
+fn parseSockaddr(sa: std.os.linux.sockaddr) !Address {
+    switch (sa.family) {
+        std.posix.AF.INET => {
+            const port = std.mem.readInt(u16, sa.data[0..2], .little);
+            return Address{ .port = port, .ipv4 = [4]u8{
+                sa.data[2],
+                sa.data[3],
+                sa.data[4],
+                sa.data[5],
+            } };
+        },
+        else => return error.UnknownFamily,
+    }
 }
 
 fn logFn(
