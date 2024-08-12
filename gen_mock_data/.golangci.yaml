@@ -1,0 +1,98 @@
+run:
+  timeout: 1m
+  allow-parallel-runners: true
+  tests: true
+
+linters-settings:
+  errcheck:
+    check-type-assertions: true
+    check-blank: true
+  gocritic:
+    enabled-tags:
+      - diagnostic
+      - performance
+      - style
+      - experimental
+    disabled-checks:
+      - whyNoLint
+      - hugeParam
+      - unnecessaryBlock
+      - sloppyReassign
+  govet:
+    enable-all: true
+    disable:
+      - fieldalignment
+      - composites
+  lll:
+    line-length: 120
+  whitespace:
+    multi-if: true
+    multi-func: true
+  nolintlint:
+    require-explanation: true
+  goconst:
+    min-len: 2
+    min-occurrences: 2
+  misspell:
+    locale: US
+  revive:
+    rules:
+      - name: var-naming
+        disabled: true
+  stylecheck:
+    checks: ["all", "-ST1003"]
+  unused:
+    field-writes-are-uses: false
+    # https://github.com/golangci/golangci-lint/issues/4218
+    #exported-is-used: false
+    exported-fields-are-used: false
+    # Enable it manually to check for unused variables.
+    # We can't enable it permanentrly, because a lot of
+    # false-positive warning for interfaces.
+    #parameters-are-used: false
+    local-variables-are-used: false
+    generated-is-used: false
+
+issues:
+  exclude:
+    - "G101"
+    - "G404"
+    - "G114"
+  exclude-rules:
+    - path: (.+)_test.go
+      linters:
+        - err113
+
+linters:
+  enable:
+    - goconst
+    - errcheck
+    - govet
+    - unconvert
+    - gosec
+    - gofmt
+    - goimports
+    - gocyclo
+    - dupl
+    - misspell
+    - lll
+    - unused
+    - whitespace
+    - nolintlint
+    - godox
+    - typecheck
+    - ineffassign
+    - stylecheck
+    - gochecknoinits
+    - gochecknoglobals
+    - exportloopref
+    - staticcheck
+    - gocritic
+    - nakedret
+    - gosimple
+    - prealloc
+    - revive
+    - err113
+    - unparam
+  disable-all: true
+  fast: false

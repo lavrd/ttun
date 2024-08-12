@@ -11,6 +11,9 @@ pub const std_options = .{
     .logFn = logFn,
 };
 
+// 100 MB.
+const BufferLength: usize = 1024 * 1024 * 100;
+
 var wait_signal = true;
 var wait_signal_mutex = std.Thread.Mutex{};
 var wait_signal_cond = std.Thread.Condition{};
@@ -144,15 +147,19 @@ pub fn main() !void {
     var proxy_server_thread: ?std.Thread = null;
     switch (config.side) {
         Side.Client => {
-            connect_proxy_server_thread = try std.Thread.spawn(.{}, connectToProxyServer, .{});
+            connect_proxy_server_thread = try std.Thread.spawn(.{}, connectToProxyServer, .{
+                @as(std.mem.Allocator, allocator),
+            });
         },
         Side.Server => {
             incoming_server_thread = try std.Thread.spawn(.{}, incomingServer, .{
+                @as(std.mem.Allocator, allocator),
                 @as(u16, 14600),
                 @as(*Channel(ProxyRequest), &req_ch),
                 @as(*Channel(ProxyResponse), &res_ch),
             });
             proxy_server_thread = try std.Thread.spawn(.{}, proxyServer, .{
+                @as(std.mem.Allocator, allocator),
                 @as(u16, 22000),
                 @as(*Channel(ProxyRequest), &req_ch),
                 @as(*Channel(ProxyResponse), &res_ch),
@@ -181,6 +188,7 @@ pub fn main() !void {
 }
 
 fn incomingServer(
+    allocator: std.mem.Allocator,
     port: u16,
     req_ch: *Channel(ProxyRequest),
     res_ch: *Channel(ProxyResponse),
@@ -207,8 +215,10 @@ fn incomingServer(
         const from_addr_p = try parseSockaddr(from_addr);
         log.debug("new connection to incoming server: {any}", .{from_addr_p});
 
-        var buf: [4096]u8 = [_]u8{0} ** 4096;
-        const n = try std.posix.read(incoming_socket, &buf);
+        var buf = try allocator.alloc(u8, BufferLength);
+        defer allocator.free(buf);
+
+        const n = try std.posix.read(incoming_socket, buf);
         log.debug("was read {d} bytes from connection: {any}", .{ n, from_addr_p });
         req_ch.send(ProxyRequest{ .data = buf[0..n] });
         log.debug("request was sent through channel for connection: {any}", .{from_addr_p});
@@ -216,6 +226,7 @@ fn incomingServer(
             log.debug("response was received through channel for connection: {any}", .{from_addr_p});
             _ = try std.posix.write(incoming_socket, data.data);
         }
+
         std.posix.close(incoming_socket);
     }
 
@@ -223,6 +234,7 @@ fn incomingServer(
 }
 
 fn proxyServer(
+    allocator: std.mem.Allocator,
     port: u16,
     req_ch: *Channel(ProxyRequest),
     res_ch: *Channel(ProxyResponse),
@@ -257,9 +269,11 @@ fn proxyServer(
         const from_addr_p = try parseSockaddr(from_addr);
         log.info("new connection is established: {any}", .{from_addr_p});
 
-        var buf: [1024]u8 = [_]u8{0} ** 1024;
+        var buf = try allocator.alloc(u8, BufferLength);
+        defer allocator.free(buf);
+
         while (shouldWait(5)) {
-            const n = std.posix.read(client_socket, &buf) catch |err| {
+            const n = std.posix.read(client_socket, buf) catch |err| {
                 switch (err) {
                     error.WouldBlock => {
                         if (req_ch.try_receive()) |req| {
@@ -281,16 +295,18 @@ fn proxyServer(
     log.info("tcp server was stopped by os signal", .{});
 }
 
-fn connectToProxyServer() !void {
+fn connectToProxyServer(allocator: std.mem.Allocator) !void {
     const proxy_socket = try initSocket();
     defer std.posix.close(proxy_socket);
     // Connect to the proxy server.
     try connect(proxy_socket, "172.17.0.3", 22000);
     log.info("connected to the proxy server", .{});
 
-    var buf: [1024]u8 = [_]u8{0} ** 1024;
+    var buf = try allocator.alloc(u8, BufferLength);
+    defer allocator.free(buf);
+
     while (shouldWait(5)) {
-        const proxy_n = std.posix.read(proxy_socket, &buf) catch |err| {
+        const proxy_n = std.posix.read(proxy_socket, buf) catch |err| {
             switch (err) {
                 error.WouldBlock => continue,
                 else => {
@@ -311,7 +327,7 @@ fn connectToProxyServer() !void {
 
         _ = try std.posix.write(target_socket, buf[0..proxy_n]);
         while (shouldWait(5)) {
-            const target_n = std.posix.read(target_socket, &buf) catch |err| {
+            const target_n = std.posix.read(target_socket, buf) catch |err| {
                 switch (err) {
                     error.WouldBlock => continue,
                     else => return,
