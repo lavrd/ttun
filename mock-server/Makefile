@@ -11,5 +11,8 @@ build_docker:
 run_docker: build_docker
 	@docker run -it --rm \
 		--name mock-server \
-		-v "${PWD}/../gen_mock_data/mock_data.txt:/mock_data/mock_data.txt" \
+		-v "${PWD}/mock_data.txt:/mock_data/mock_data.txt" \
 		mock-server
+
+gen_mock_data:
+	@go run . gen
