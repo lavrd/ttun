@@ -32,7 +32,7 @@ func main() {
 }
 
 func genMockData() error {
-	file, err := os.OpenFile("mock_data.txt", os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	file, err := os.OpenFile("./data/bytes.txt", os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	if err != nil {
 		return fmt.Errorf("failed to open file to save mock data: %w", err)
 	}
@@ -61,7 +61,7 @@ func runServer() error {
 		logger.Info("new http request", "method", r.Method, "uro", r.RequestURI)
 		w.WriteHeader(http.StatusOK)
 	})
-	http.Handle("/mock-data/", http.StripPrefix("/mock-data", http.FileServer(http.Dir("/mock_data"))))
+	http.Handle("/data/", http.StripPrefix("/data", http.FileServer(http.Dir("/data"))))
 	logger.Info("starting http server")
 	if err := http.ListenAndServe("0.0.0.0:44000", nil); err != nil {
 		return fmt.Errorf("failed to listen and serve: %w", err)
