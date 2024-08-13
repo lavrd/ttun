@@ -14,8 +14,6 @@ pub const std_options = .{
 // 10MB.
 const NetworkBufferLength: usize = 1024 * 1024 * 10;
 
-const ChannelBufferLength: usize = 100;
-
 var wait_signal = true;
 var wait_signal_mutex = std.Thread.Mutex{};
 var wait_signal_cond = std.Thread.Condition{};
@@ -46,14 +44,14 @@ fn Channel(comptime T: type) type {
     return struct {
         const Self = @This();
 
-        _raw: [ChannelBufferLength]?T,
+        _raw: std.ArrayList(T),
         _mutex: std.Thread.Mutex,
         _cond: std.Thread.Condition,
         _is_closed: bool,
 
-        fn Init() Self {
+        fn Init(allocator: std.mem.Allocator) Self {
             return .{
-                ._raw = [_]?T{null} ** ChannelBufferLength,
+                ._raw = std.ArrayList(T).init(allocator),
                 ._mutex = .{},
                 ._cond = .{},
                 ._is_closed = false,
@@ -64,14 +62,8 @@ fn Channel(comptime T: type) type {
             self._mutex.lock();
             defer self._mutex.unlock();
             if (self._is_closed) return error.Closed;
-            for (0..ChannelBufferLength) |index| {
-                if (self._raw[index] == null) {
-                    self._raw[index] = data;
-                    self._cond.signal();
-                    return;
-                }
-            }
-            return error.NoSpace;
+            try self._raw.insert(0, data);
+            self._cond.signal();
         }
 
         fn try_receive(
@@ -80,28 +72,16 @@ fn Channel(comptime T: type) type {
             self._mutex.lock();
             defer self._mutex.unlock();
             if (self._is_closed) return error.Closed;
-            return self._change();
+            return self._raw.popOrNull();
         }
 
         fn close(self: *Self) void {
             self._mutex.lock();
             defer self._mutex.unlock();
-            for (0..ChannelBufferLength) |index| {
-                self._raw[index] = null;
-            }
+            self._raw.clearAndFree();
+            self._raw.deinit();
             self._is_closed = true;
             self._cond.signal();
-        }
-
-        fn _change(self: *Self) ?T {
-            for (0..ChannelBufferLength) |index| {
-                if (self._raw[index] != null) {
-                    const raw = self._raw[index];
-                    self._raw[index] = null;
-                    return raw;
-                }
-            }
-            return null;
         }
     };
 }
@@ -145,8 +125,8 @@ pub fn main() !void {
     const config = try parseConfig(allocator);
     log.info("starting as a {any}", .{config});
 
-    var req_ch = Channel(ProxyRequest).Init();
-    var res_ch = Channel(ProxyResponse).Init();
+    var req_ch = Channel(ProxyRequest).Init(allocator);
+    var res_ch = Channel(ProxyResponse).Init(allocator);
 
     var connect_proxy_server_thread: ?std.Thread = null;
     var incoming_server_thread: ?std.Thread = null;
@@ -233,7 +213,25 @@ fn incomingServer(
                                 "response was received through channel for connection: {any}",
                                 .{from_addr_p},
                             );
-                            _ = try std.posix.write(client_socket, data.data);
+                            while (shouldWait(5)) {
+                                const n = std.posix.write(client_socket, data.data) catch |client_socket_err| {
+                                    switch (client_socket_err) {
+                                        error.WouldBlock => {
+                                            log.warn("would block on try to send data to client socket", .{});
+                                            continue;
+                                        },
+                                        else => {
+                                            log.err(
+                                                "failed to write data to client socket: {any}",
+                                                .{client_socket_err},
+                                            );
+                                            return;
+                                        },
+                                    }
+                                };
+                                log.debug("successfully wrote {d} bytes to client socket", .{n});
+                                break;
+                            }
                         }
                         continue;
                     },
@@ -348,7 +346,9 @@ fn connectToProxyServer() !void {
                     log.debug("read {d} bytes from target connection", .{target_n});
                     _ = std.posix.write(proxy_socket, buf[0..target_n]) catch |err| {
                         switch (err) {
-                            error.WouldBlock => {},
+                            error.WouldBlock => {
+                                log.err("would block on try to send data to proxy socket", .{});
+                            },
                             else => {
                                 log.err("failed to wrote to proxy socket: {any}", .{err});
                                 return;
