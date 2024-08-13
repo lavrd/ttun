@@ -56,9 +56,12 @@ fn Channel(comptime T: type) type {
             };
         }
 
-        fn send(self: *Self, data: T) void {
+        fn send(self: *Self, data: T) !void {
             self._mutex.lock();
             defer self._mutex.unlock();
+            if (self._raw != null) {
+                return error.ValueNotNull;
+            }
             self._raw = data;
             self._cond.signal();
         }
@@ -188,16 +191,16 @@ fn incomingServer(
     req_ch: *Channel(ProxyRequest),
     res_ch: *Channel(ProxyResponse),
 ) !void {
-    const socket = try initSocket();
-    defer std.posix.close(socket);
-    try listen(socket, "0.0.0.0", port);
+    const incoming_socket = try initSocket();
+    defer std.posix.close(incoming_socket);
+    try listen(incoming_socket, "0.0.0.0", port);
     log.info("starting incoming tcp server on {any}", .{port});
 
     while (shouldWait(5)) {
         var from_addr: std.posix.sockaddr = undefined;
         var from_addr_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr);
-        const incoming_socket = std.posix.accept(
-            socket,
+        const client_socket = std.posix.accept(
+            incoming_socket,
             &from_addr,
             &from_addr_len,
             std.posix.SOCK.NONBLOCK,
@@ -210,7 +213,7 @@ fn incomingServer(
                 },
             }
         };
-        defer std.posix.close(incoming_socket);
+        defer std.posix.close(client_socket);
         const from_addr_p = try parseSockaddr(from_addr);
         log.debug(
             "new connection  to incoming server is established: {any}",
@@ -219,12 +222,12 @@ fn incomingServer(
 
         var buf: [BufferLength]u8 = [_]u8{0} ** BufferLength;
         while (shouldWait(5)) {
-            const n = std.posix.read(incoming_socket, &buf) catch |err| {
+            const n = std.posix.read(client_socket, &buf) catch |err| {
                 switch (err) {
                     error.WouldBlock => {
                         if (res_ch.try_receive()) |data| {
                             log.debug("response was received through channel for connection: {any}", .{from_addr_p});
-                            _ = try std.posix.write(incoming_socket, data.data);
+                            _ = try std.posix.write(client_socket, data.data);
                         }
                         continue;
                     },
@@ -257,30 +260,25 @@ fn proxyServer(
     try listen(proxy_socket, "0.0.0.0", port);
     log.info("starting proxy tcp server on {any}", .{port});
 
-    wait_connection: while (shouldWait(5)) {
+    while (shouldWait(5)) {
         var client_socket: std.posix.socket_t = undefined;
         var from_addr: std.posix.sockaddr = undefined;
         var from_addr_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr);
-        while (shouldWait(5)) {
-            client_socket = std.posix.accept(
-                proxy_socket,
-                &from_addr,
-                &from_addr_len,
-                std.posix.SOCK.NONBLOCK,
-            ) catch |err| {
-                switch (err) {
-                    error.WouldBlock => continue,
-                    else => {
-                        log.err("failed to accept new client to proxy server: {any}", .{err});
-                        return;
-                    },
-                }
-            };
-            break;
-        } else {
-            log.info("tcp server was stopped by os signal", .{});
-            return;
-        }
+
+        client_socket = std.posix.accept(
+            proxy_socket,
+            &from_addr,
+            &from_addr_len,
+            std.posix.SOCK.NONBLOCK,
+        ) catch |err| {
+            switch (err) {
+                error.WouldBlock => continue,
+                else => {
+                    log.err("failed to accept new client to proxy server: {any}", .{err});
+                    return;
+                },
+            }
+        };
         defer std.posix.close(client_socket);
         const from_addr_p = try parseSockaddr(from_addr);
         log.info("new connection to the proxy server is established: {any}", .{from_addr_p});
@@ -303,7 +301,7 @@ fn proxyServer(
             };
             if (n == 0) {
                 log.info("tcp connection closed", .{});
-                continue :wait_connection;
+                break;
             }
             res_ch.send(ProxyResponse{ .data = buf[0..n] });
         }
