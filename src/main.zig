@@ -204,7 +204,10 @@ fn incomingServer(
         ) catch |err| {
             switch (err) {
                 error.WouldBlock => continue,
-                else => return,
+                else => {
+                    log.err("failed to accpent incoming socket connection: {any}", .{err});
+                    return;
+                },
             }
         };
         defer std.posix.close(incoming_socket);
@@ -225,11 +228,14 @@ fn incomingServer(
                         }
                         continue;
                     },
-                    else => return,
+                    else => {
+                        log.err("failed to read from icoming socket: {any}", .{err});
+                        return;
+                    },
                 }
             };
             if (n == 0) {
-                log.info("tcp connection closed", .{});
+                log.info("incoming tcp connection was closed", .{});
                 break;
             }
             log.debug("was read {d} bytes from incoming connection: {any}", .{ n, from_addr_p });
@@ -246,9 +252,9 @@ fn proxyServer(
     req_ch: *Channel(ProxyRequest),
     res_ch: *Channel(ProxyResponse),
 ) !void {
-    const socket = try initSocket();
-    defer std.posix.close(socket);
-    try listen(socket, "0.0.0.0", port);
+    const proxy_socket = try initSocket();
+    defer std.posix.close(proxy_socket);
+    try listen(proxy_socket, "0.0.0.0", port);
     log.info("starting proxy tcp server on {any}", .{port});
 
     wait_connection: while (shouldWait(5)) {
@@ -257,14 +263,17 @@ fn proxyServer(
         var from_addr_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr);
         while (shouldWait(5)) {
             client_socket = std.posix.accept(
-                socket,
+                proxy_socket,
                 &from_addr,
                 &from_addr_len,
                 std.posix.SOCK.NONBLOCK,
             ) catch |err| {
                 switch (err) {
                     error.WouldBlock => continue,
-                    else => return,
+                    else => {
+                        log.err("failed to accept new client to proxy server: {any}", .{err});
+                        return;
+                    },
                 }
             };
             break;
@@ -286,7 +295,10 @@ fn proxyServer(
                         }
                         continue;
                     },
-                    else => return,
+                    else => {
+                        log.err("failed to read from client socket: {any}", .{err});
+                        return;
+                    },
                 }
             };
             if (n == 0) {
@@ -319,24 +331,27 @@ fn connectToProxyServer() !void {
                     const target_n = std.posix.read(target_socket, &buf) catch |err| {
                         switch (err) {
                             error.WouldBlock => continue,
-                            else => return,
+                            else => {
+                                log.err("failed to read from target socket: {any}", .{err});
+                                return;
+                            },
                         }
                     };
                     if (target_n == 0) {
-                        log.info("tcp connection with target socket is closed", .{});
+                        log.info("tcp connection with target socket was closed", .{});
                         return;
                     }
                     _ = try std.posix.write(proxy_socket, buf[0..target_n]);
                     continue;
                 },
                 else => {
-                    log.err("failed to read from proxy server: {any}", .{proxy_err});
+                    log.err("failed to read from proxy server socket: {any}", .{proxy_err});
                     return;
                 },
             }
         };
         if (proxy_n == 0) {
-            log.info("tcp connection with proxy server closed", .{});
+            log.info("tcp connection with proxy server was closed", .{});
             return;
         }
         log.debug("read {d} bytes from proxy server", .{proxy_n});
