@@ -11,8 +11,8 @@ pub const std_options = .{
     .logFn = logFn,
 };
 
-// 1MB.
-const BufferLength: usize = 1024 * 1024;
+// 10MB.
+const BufferLength: usize = 1024 * 1024 * 10;
 
 var wait_signal = true;
 var wait_signal_mutex = std.Thread.Mutex{};
@@ -322,6 +322,10 @@ fn connectToProxyServer() !void {
                             else => return,
                         }
                     };
+                    if (target_n == 0) {
+                        log.info("tcp connection with target socket is closed", .{});
+                        return;
+                    }
                     _ = try std.posix.write(proxy_socket, buf[0..target_n]);
                     continue;
                 },

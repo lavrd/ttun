@@ -27,3 +27,6 @@ run_docker_server: build_docker
 		--name ttun-server \
 		-p 14600:14600 \
   	ttun "{\"side\":\"Server\"}"
+
+curl_download:
+	curl -iLX GET 'http://127.0.0.1:14600/mock-data/mock_data.txt' -o mock_data.txt

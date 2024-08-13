@@ -58,7 +58,7 @@ func genMockData() error {
 func runServer() error {
 	logger := slog.Default()
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		logger.Info("new http request")
+		logger.Info("new http request", "method", r.Method, "uro", r.RequestURI)
 		w.WriteHeader(http.StatusOK)
 	})
 	http.Handle("/mock-data/", http.StripPrefix("/mock-data", http.FileServer(http.Dir("/mock_data"))))
