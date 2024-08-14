@@ -339,7 +339,22 @@ fn connectToProxyServer() !void {
                         return;
                     }
                     log.debug("read {d} bytes from target connection", .{target_n});
-                    _ = try std.posix.write(proxy_socket, buf[0..target_n]);
+                    while (shouldWait(5)) {
+                        const n = std.posix.write(proxy_socket, buf[0..target_n]) catch |err| {
+                            switch (err) {
+                                error.WouldBlock => {
+                                    log.warn("would block on trying to write to proxy socket", .{});
+                                    continue;
+                                },
+                                else => {
+                                    log.err("failed to write to proxy socket: {any}", .{err});
+                                    return err;
+                                },
+                            }
+                        };
+                        log.debug("{d} wrote to the proxy socket", .{n});
+                        break;
+                    }
                     continue;
                 },
                 else => {

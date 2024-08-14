@@ -38,8 +38,8 @@ func genMockData() error {
 	}
 	defer file.Close()
 
-	// 1GB.
-	const fileSize = 1024 * 1024 * 1024
+	// 50MB.
+	const fileSize = 1024 * 1024 * 50
 	// 1MB.
 	const bufferSize = 1024 * 1024
 	buffer := make([]byte, bufferSize)
