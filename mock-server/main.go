@@ -38,8 +38,8 @@ func genMockData() error {
 	}
 	defer file.Close()
 
-	// 50MB.
-	const fileSize = 1024 * 1024 * 50
+	// 1GB.
+	const fileSize = 1024 * 1024 * 1024
 	// 1MB.
 	const bufferSize = 1024 * 1024
 	buffer := make([]byte, bufferSize)
@@ -57,14 +57,23 @@ func genMockData() error {
 
 func runServer() error {
 	logger := slog.Default()
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		logger.Info("new http request", "method", r.Method, "uro", r.RequestURI)
-		w.WriteHeader(http.StatusOK)
-	})
-	http.Handle("/data/", http.StripPrefix("/data", http.FileServer(http.Dir("/data"))))
+	loggerMiddleware := &LoggerMiddleware{logger: logger}
+	http.Handle("/health", loggerMiddleware.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })))
+	http.Handle("/data/", loggerMiddleware.Handler(http.StripPrefix("/data", http.FileServer(http.Dir("/data")))))
 	logger.Info("starting http server")
 	if err := http.ListenAndServe("0.0.0.0:44000", nil); err != nil {
 		return fmt.Errorf("failed to listen and serve: %w", err)
 	}
 	return nil
+}
+
+type LoggerMiddleware struct {
+	logger *slog.Logger
+}
+
+func (l *LoggerMiddleware) Handler(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		l.logger.Info("http request", "method", r.Method, "uri", r.RequestURI)
+		h.ServeHTTP(w, r)
+	})
 }

@@ -28,5 +28,8 @@ run_docker_server: build_docker
 		-p 14600:14600 \
   	ttun "{\"side\":\"Server\"}"
 
-curl_download:
+curl_download_bytes:
 	curl -iLX GET 'http://127.0.0.1:14600/data/bytes.txt' -o mock.bytes.txt
+
+curl_download_image:
+	curl -LX GET 'http://127.0.0.1:14600/data/image.jpg' -o image.jpg

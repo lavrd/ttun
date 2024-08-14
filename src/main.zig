@@ -46,14 +46,12 @@ fn Channel(comptime T: type) type {
 
         _raw: std.ArrayList(T),
         _mutex: std.Thread.Mutex,
-        _cond: std.Thread.Condition,
         _is_closed: bool,
 
         fn Init(allocator: std.mem.Allocator) Self {
             return .{
                 ._raw = std.ArrayList(T).init(allocator),
                 ._mutex = .{},
-                ._cond = .{},
                 ._is_closed = false,
             };
         }
@@ -63,7 +61,6 @@ fn Channel(comptime T: type) type {
             defer self._mutex.unlock();
             if (self._is_closed) return error.Closed;
             try self._raw.insert(0, data);
-            self._cond.signal();
         }
 
         fn try_receive(
@@ -81,7 +78,6 @@ fn Channel(comptime T: type) type {
             self._raw.clearAndFree();
             self._raw.deinit();
             self._is_closed = true;
-            self._cond.signal();
         }
     };
 }
@@ -196,62 +192,60 @@ fn incomingServer(
                 },
             }
         };
-        defer std.posix.close(client_socket);
-        const from_addr_p = try parseSockaddr(from_addr);
-        log.debug(
-            "new connection to incoming server is established: {any}",
-            .{from_addr_p},
-        );
 
-        var buf: [NetworkBufferLength]u8 = [_]u8{0} ** NetworkBufferLength;
-        while (shouldWait(5)) {
-            const n = std.posix.read(client_socket, &buf) catch |err| {
-                switch (err) {
-                    error.WouldBlock => {
-                        if (try res_ch.try_receive()) |data| {
-                            log.debug(
-                                "response was received through channel for connection: {any}",
-                                .{from_addr_p},
-                            );
-                            while (shouldWait(5)) {
-                                const n = std.posix.write(client_socket, data.data) catch |client_socket_err| {
-                                    switch (client_socket_err) {
-                                        error.WouldBlock => {
-                                            log.warn("would block on try to send data to client socket", .{});
-                                            continue;
-                                        },
-                                        else => {
-                                            log.err(
-                                                "failed to write data to client socket: {any}",
-                                                .{client_socket_err},
-                                            );
-                                            return;
-                                        },
-                                    }
-                                };
-                                log.debug("successfully wrote {d} bytes to client socket", .{n});
-                                break;
-                            }
-                        }
-                        continue;
-                    },
-                    else => {
-                        log.err("failed to read from icoming socket: {any}", .{err});
-                        return;
-                    },
-                }
-            };
-            if (n == 0) {
-                log.info("incoming tcp connection was closed", .{});
-                break;
-            }
-            log.debug("was read {d} bytes from incoming connection: {any}", .{ n, from_addr_p });
-            try req_ch.send(ProxyRequest{ .data = buf[0..n] });
-            log.debug("request was sent through channel for connection: {any}", .{from_addr_p});
-        }
+        _ = try std.Thread.spawn(.{}, handleIncomingConnection, .{
+            @as(std.posix.socket_t, client_socket),
+            @as(*Channel(ProxyRequest), req_ch),
+            @as(*Channel(ProxyResponse), res_ch),
+            @as(std.posix.sockaddr, from_addr),
+        });
     }
 
     log.info("incoming tcp server was stopped by os signal", .{});
+}
+
+fn handleIncomingConnection(
+    client_socket: std.posix.socket_t,
+    req_ch: *Channel(ProxyRequest),
+    res_ch: *Channel(ProxyResponse),
+    from_addr: std.posix.sockaddr,
+) !void {
+    defer std.posix.close(client_socket);
+    const from_addr_p = try parseSockaddr(from_addr);
+    log.debug(
+        "new connection to incoming server is established: {any}",
+        .{from_addr_p},
+    );
+
+    var buf: [NetworkBufferLength]u8 = [_]u8{0} ** NetworkBufferLength;
+    while (shouldWait(5)) {
+        const n = std.posix.read(client_socket, &buf) catch |err| {
+            switch (err) {
+                error.WouldBlock => {
+                    if (try res_ch.try_receive()) |data| {
+                        log.debug(
+                            "response was received through channel for connection: {any}",
+                            .{from_addr_p},
+                        );
+                        const n = try std.posix.write(client_socket, data.data);
+                        log.debug("successfully wrote {d} bytes to client socket", .{n});
+                    }
+                    continue;
+                },
+                else => {
+                    log.err("failed to read from icoming socket: {any}", .{err});
+                    return;
+                },
+            }
+        };
+        if (n == 0) {
+            log.info("incoming tcp connection was closed", .{});
+            break;
+        }
+        log.debug("was read {d} bytes from incoming connection: {any}", .{ n, from_addr_p });
+        try req_ch.send(ProxyRequest{ .data = buf[0..n] });
+        log.debug("request was sent through channel for connection: {any}", .{from_addr_p});
+    }
 }
 
 fn proxyServer(
@@ -307,6 +301,7 @@ fn proxyServer(
                 log.info("tcp connection closed", .{});
                 break;
             }
+            log.debug("was read {d} bytes from the proxy client", .{n});
             try res_ch.send(ProxyResponse{ .data = buf[0..n] });
         }
     }
@@ -344,17 +339,7 @@ fn connectToProxyServer() !void {
                         return;
                     }
                     log.debug("read {d} bytes from target connection", .{target_n});
-                    _ = std.posix.write(proxy_socket, buf[0..target_n]) catch |err| {
-                        switch (err) {
-                            error.WouldBlock => {
-                                log.err("would block on try to send data to proxy socket", .{});
-                            },
-                            else => {
-                                log.err("failed to wrote to proxy socket: {any}", .{err});
-                                return;
-                            },
-                        }
-                    };
+                    _ = try std.posix.write(proxy_socket, buf[0..target_n]);
                     continue;
                 },
                 else => {
@@ -420,6 +405,8 @@ fn initSocket() !std.posix.socket_t {
     // Make socket work in non-blocking mode.
     const flags = try std.posix.fcntl(socket, std.posix.F.GETFL, 0);
     _ = try std.posix.fcntl(socket, std.posix.F.SETFL, flags | std.posix.SOCK.NONBLOCK);
+    // Make socket keep-alive.
+    try std.posix.setsockopt(socket, std.posix.SOL.SOCKET, std.posix.SO.KEEPALIVE, &std.mem.toBytes(@as(c_int, 1)));
     return socket;
 }
 

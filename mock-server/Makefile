@@ -11,6 +11,7 @@ build_docker:
 run_docker: build_docker
 	@docker run -it --rm \
 		--name mock-server \
+		-p 12300:44000 \
 		-v "${PWD}/data/:/data/" \
 		mock-server run
 
