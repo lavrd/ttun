@@ -32,7 +32,7 @@ func main() {
 }
 
 func genMockData() error {
-	file, err := os.OpenFile("./data/bytes.txt", os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	file, err := os.OpenFile("../data/bytes.txt", os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	if err != nil {
 		return fmt.Errorf("failed to open file to save mock data: %w", err)
 	}
@@ -58,7 +58,7 @@ func genMockData() error {
 func runServer() error {
 	logger := slog.Default()
 	loggerMiddleware := &LoggerMiddleware{logger: logger}
-	http.Handle("/health", loggerMiddleware.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })))
+	http.Handle("/health", loggerMiddleware.Handler(http.HandlerFunc(healthHandler)))
 	http.Handle("/data/", loggerMiddleware.Handler(http.StripPrefix("/data", http.FileServer(http.Dir("/data")))))
 	logger.Info("starting http server")
 	if err := http.ListenAndServe("0.0.0.0:44000", nil); err != nil {
@@ -76,4 +76,8 @@ func (l *LoggerMiddleware) Handler(h http.Handler) http.Handler {
 		l.logger.Info("http request", "method", r.Method, "uri", r.RequestURI)
 		h.ServeHTTP(w, r)
 	})
+}
+
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
 }

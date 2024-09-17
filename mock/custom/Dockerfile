@@ -1,4 +1,4 @@
-FROM golang:1.22.6-alpine3.20
+FROM golang:1.23.1-alpine3.20
 WORKDIR /mock-server
 COPY go.mod .
 COPY main.go .

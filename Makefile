@@ -17,12 +17,12 @@ test: format
 test_one: format
 	zig test src/main.zig --test-filter $(name)
 
-run_docker_client: build_docker
+run_docker_client:
 	docker run --rm -it \
 		--name ttun-client \
   	ttun "{\"side\":\"Client\"}"
 
-run_docker_server: build_docker
+run_docker_server:
 	docker run --rm -it \
 		--name ttun-server \
 		-p 14600:14600 \

@@ -85,7 +85,6 @@ linters:
     - stylecheck
     - gochecknoinits
     - gochecknoglobals
-    - exportloopref
     - staticcheck
     - gocritic
     - nakedret
@@ -94,5 +93,6 @@ linters:
     - revive
     - err113
     - unparam
+    - copyloopvar
   disable-all: true
   fast: false
