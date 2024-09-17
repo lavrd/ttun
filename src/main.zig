@@ -320,6 +320,7 @@ fn connectToProxyServer() !void {
     try connect(target_socket, "172.17.0.2", 44000);
     log.info("connected to the target server", .{});
 
+    var hp: std.http.HeadParser = .{};
     var buf: [NetworkBufferLength]u8 = [_]u8{0} ** NetworkBufferLength;
     while (shouldWait(5)) {
         const proxy_n = std.posix.read(proxy_socket, &buf) catch |proxy_err| {
@@ -339,6 +340,15 @@ fn connectToProxyServer() !void {
                         return;
                     }
                     log.debug("read {d} bytes from target connection", .{target_n});
+
+                    if (hp.state != std.http.HeadParser.State.finished) {
+                        const header_n = hp.feed(buf[0..target_n]);
+                        var header_iter = std.http.HeaderIterator.init(buf[0..header_n]);
+                        while (header_iter.next()) |header| {
+                            log.debug("Header: {s} = {s}", .{ header.name, header.value });
+                        }
+                    }
+
                     while (shouldWait(5)) {
                         const n = std.posix.write(proxy_socket, buf[0..target_n]) catch |err| {
                             switch (err) {

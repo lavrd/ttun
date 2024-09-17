@@ -12,7 +12,7 @@ run_docker: build_docker
 	@docker run -it --rm \
 		--name mock-custom \
 		-p 12300:44000 \
-		-v "${PWD}/data/:/data/" \
+		-v "${PWD}/../data/:/data/" \
 		mock-custom run
 
 gen_mock_bytes:

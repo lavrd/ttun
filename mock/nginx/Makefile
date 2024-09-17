@@ -5,5 +5,5 @@ run_docker: build_docker
 	@docker run -it --rm \
 		--name mock-nginx \
 		-v "${PWD}/../data/:/usr/share/nginx/html/data" \
-		-p 15700:80 \
+		-p 12300:44000 \
 		mock-nginx
