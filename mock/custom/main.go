@@ -27,7 +27,7 @@ func main() {
 			return
 		}
 	default:
-		logger.Error("unknown command for mock-server", "command", os.Args[1])
+		logger.Error("unknown command for mock-custom", "command", os.Args[1])
 	}
 }
 

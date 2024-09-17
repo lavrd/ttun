@@ -6,14 +6,14 @@ lint:
 	@golangci-lint run main.go
 
 build_docker:
-	@docker build -t mock-server -f Dockerfile .
+	@docker build -t mock-custom -f Dockerfile .
 
 run_docker: build_docker
 	@docker run -it --rm \
-		--name mock-server \
+		--name mock-custom \
 		-p 12300:44000 \
 		-v "${PWD}/data/:/data/" \
-		mock-server run
+		mock-custom run
 
 gen_mock_bytes:
 	@go run . gen
