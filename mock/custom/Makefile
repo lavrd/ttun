@@ -1,10 +1,3 @@
-format:
-	@go fmt main.go
-
-lint:
-	@go fmt ./...
-	@golangci-lint run main.go
-
 build_docker:
 	@docker build -t mock-custom -f Dockerfile .
 

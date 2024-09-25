@@ -1,21 +1,20 @@
 format:
-	zig fmt src/main.zig
+	@go fmt main.go && \
+		go fmt mock/custom/main.go
 
-build: format
-	zig build --summary all
+lint: format
+	@go fmt ./...
+	@golangci-lint run main.go && \
+		golangci-lint run mock/custom/main.go
 
-build_linux: format
-	mkdir -p zig-out/linux/bin
-	./build.sh
+build:
+	@./build.sh
 
-build_docker: build_linux
+build_docker: build
 	docker build -t ttun -f Dockerfile .
 
-test: format
-	zig test src/main.zig
-
-test_one: format
-	zig test src/main.zig --test-filter $(name)
+test:
+	go test -timeout 1m -v -count 1
 
 run_docker_client:
 	docker run --rm -it \

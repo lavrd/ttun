@@ -1,16 +1,15 @@
 #!/bin/bash
 
-uname_output=$(uname -m)
-if [[ $uname_output == "arm64" ]]; then
-    arch="aarch64-linux"
-elif [[ $uname_output == "x86_64" ]]; then
-    arch="x86_64-linux"
+goarch=""
+uname_arch=$(uname -m)
+if [[ $uname_arch == "arm64" ]]; then
+    goarch="arm64"
+elif [[ $uname_arch == "x86_64" ]]; then
+    goarch="amd64"
 else
-    echo "Error: unknown architecture to build binary file:" ${uname_output}
+    echo "Error: unknown architecture to build binary file:" ${uname_arch}
     exit 1
 fi
 
-zig build-exe src/main.zig \
-  -target ${arch} \
-  --library c \
-  -femit-bin=zig-out/linux/bin/ttun
+CGO_ENABLED=0 GOOS="linux" GOARCH=${goarch} \
+    go build -o target/ttun

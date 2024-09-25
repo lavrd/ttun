@@ -1,5 +1,5 @@
 run:
-  timeout: 1m
+  timeout: 10m
   allow-parallel-runners: true
   tests: true
 
@@ -57,7 +57,6 @@ issues:
   exclude:
     - "G101"
     - "G404"
-    - "G114"
   exclude-rules:
     - path: (.+)_test.go
       linters:

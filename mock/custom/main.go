@@ -11,8 +11,7 @@ import (
 func main() {
 	logger := slog.Default()
 	if len(os.Args) != 2 {
-		logger.Error("invalid number of arguments to proceed",
-			"number", len(os.Args), "required", 2)
+		logger.Error("invalid number of arguments to proceed", "number", len(os.Args), "required", 2)
 		return
 	}
 	switch os.Args[1] {
@@ -27,7 +26,7 @@ func main() {
 			return
 		}
 	default:
-		logger.Error("unknown command for mock-custom", "command", os.Args[1])
+		logger.Error("unknown command for custom mock server", "command", os.Args[1])
 	}
 }
 
