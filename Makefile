@@ -16,16 +16,16 @@ build_docker: build
 test:
 	go test -timeout 1m -v -count 1
 
-run_docker_client:
+run_docker_local:
 	docker run --rm -it \
-		--name ttun-client \
-  	ttun "{\"side\":\"Client\"}"
+		--name ttun-local \
+  	ttun local
 
-run_docker_server:
+run_docker_public:
 	docker run --rm -it \
-		--name ttun-server \
+		--name ttun-public \
 		-p 14600:14600 \
-  	ttun "{\"side\":\"Server\"}"
+  	ttun public
 
 curl_download_bytes:
 	curl -LX GET 'http://127.0.0.1:14600/data/bytes.txt' -o mock.bytes.txt
