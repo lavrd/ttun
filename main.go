@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -26,15 +27,18 @@ func main() {
 		logger.Fatal().Msg("incorrect number of os arguments")
 	}
 
-	stopC := make(chan struct{})
+	service := &Service{
+		stop:   &atomic.Bool{},
+		logger: &logger,
+	}
 
 	group := new(errgroup.Group)
 	switch os.Args[1] {
 	case "local":
-		group.Go(StartLocalServer)
+		group.Go(service.StartLocalServer)
 	case "public":
-		group.Go(StartIncomingServer(stopC))
-		group.Go(StartProxyServer)
+		group.Go(service.StartIncomingServer)
+		group.Go(service.StartProxyServer)
 	default:
 		logger.Fatal().Str("arg", os.Args[1]).Msg("unknown argument to start ttun")
 	}
@@ -44,10 +48,98 @@ func main() {
 	signalName := (<-interrupt).String()
 	logger.Debug().Str("signal", signalName).Msg("received os signal")
 
-	close(stopC)
+	service.stop.Store(true)
 
 	if err := group.Wait(); err != nil {
 		logger.Error().Err(err).Msg("failed to wait for threads")
+	}
+}
+
+type Service struct {
+	stop   *atomic.Bool
+	logger *zerolog.Logger
+}
+
+func (s *Service) StartLocalServer() error { return nil }
+
+func (s *Service) StartIncomingServer() error {
+	incomingSocketPort := 14600
+	incomingSocket, err := InitSocket()
+	if err != nil {
+		return fmt.Errorf("failed to init incoming socket: %w", err)
+	}
+	if err = Listen(incomingSocket, incomingSocketPort); err != nil {
+		return fmt.Errorf("failed to listen incoming socket: %w", err)
+	}
+	// logger.Info().Int("port", incomingSocketPort).Msg("listen for incoming socket") // todo: set
+
+	// todo: how to wait and break array?
+	group := new(errgroup.Group)
+	for {
+		if s.stop.Load() {
+			// todo: make log
+			break
+		}
+
+		var nfd int // todo: rename
+		nfd, _, err = syscall.Accept(incomingSocket)
+		if err != nil {
+			if errors.Is(err, syscall.EAGAIN) {
+				fmt.Println("") // todo: delete
+				time.Sleep(time.Millisecond * 5)
+				continue
+			}
+			return fmt.Errorf("failed to accept new connection: %w", err)
+		}
+
+		conn := &Connection{
+			fd:     nfd,
+			logger: s.logger,
+		}
+		group.Go(conn.Handle)
+	}
+	if err = group.Wait(); err != nil {
+		return fmt.Errorf("failed to wait for connections: %w", err)
+	}
+
+	return nil
+}
+
+func (s *Service) StartProxyServer() error {
+	// 22000
+	return nil
+}
+
+type Connection struct {
+	fd int
+	// todo: store address of the connection inside logger
+	logger *zerolog.Logger
+}
+
+func (c *Connection) Handle() error {
+	defer func() {
+		if err := syscall.Close(c.fd); err != nil {
+			c.logger.Error().Err(err).Msg("failed to close connection")
+		}
+	}()
+
+	buffer := make([]byte, NetworkBufferSize)
+	for {
+		n, err := syscall.Read(c.fd, buffer)
+		if err != nil {
+			if errors.Is(err, syscall.EAGAIN) {
+				time.Sleep(time.Millisecond * 5)
+				continue
+			}
+			return fmt.Errorf("failed to read from socket: %w", err)
+		}
+		if n == 0 {
+			// todo: log that connection was closed
+			return nil
+		}
+		if _, err = syscall.Write(c.fd, buffer[:n]); err != nil {
+			return fmt.Errorf("failed to write to the socket: %w", err)
+		}
 	}
 }
 
@@ -71,78 +163,5 @@ func Listen(fd, port int) error {
 	if err := syscall.Listen(fd, syscall.SOMAXCONN); err != nil {
 		return fmt.Errorf("failed to listen: %w", err)
 	}
-	return nil
-}
-
-func StartLocalServer() error { return nil }
-
-func StartIncomingServer(stopC chan struct{}) func() error {
-	return func() error {
-		incomingSocketPort := 14600
-		incomingSocket, err := InitSocket()
-		if err != nil {
-			return fmt.Errorf("failed to init incoming socket: %w", err)
-		}
-		if err = Listen(incomingSocket, incomingSocketPort); err != nil {
-			return fmt.Errorf("failed to listen incoming socket: %w", err)
-		}
-		// logger.Info().Int("port", incomingSocketPort).Msg("listen for incoming socket") // todo: set
-
-		// todo: how to wait and break array?
-		group := new(errgroup.Group)
-		for {
-			if _, ok := <-stopC; !ok {
-				// todo: make log
-				fmt.Println("...") // todo: remove
-				break
-			}
-			var nfd int
-			nfd, _, err = syscall.Accept(incomingSocket)
-			if err != nil {
-				if errors.Is(err, syscall.EAGAIN) {
-					fmt.Println("") // todo: delete
-					time.Sleep(time.Millisecond * 5)
-					continue
-				}
-				return fmt.Errorf("failed to accept new connection: %w", err)
-			}
-			group.Go(HandleConnection(nfd))
-		}
-
-		if err = group.Wait(); err != nil {
-			return fmt.Errorf("failed to wait for connections: %w", err)
-		}
-
-		return nil
-	}
-}
-
-func HandleConnection(fd int) func() error {
-	return func() error {
-		defer syscall.Close(fd)
-
-		buffer := make([]byte, NetworkBufferSize)
-		for {
-			n, err := syscall.Read(fd, buffer)
-			if err != nil {
-				if errors.Is(err, syscall.EAGAIN) {
-					time.Sleep(time.Millisecond * 5)
-					continue
-				}
-				return fmt.Errorf("failed to read from socket: %w", err)
-			}
-			if n == 0 {
-				// todo: log that connection was closed
-				return nil
-			}
-			if _, err = syscall.Write(fd, buffer[:n]); err != nil {
-				return fmt.Errorf("failed to write to the socket: %w", err)
-			}
-		}
-	}
-}
-
-func StartProxyServer() error {
-	// 22000
 	return nil
 }
