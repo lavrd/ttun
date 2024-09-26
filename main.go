@@ -1,8 +1,11 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"math/rand"
+	"net"
 	"os"
 	"os/signal"
 	"sync/atomic"
@@ -14,6 +17,20 @@ import (
 )
 
 const NetworkBufferSize = 1024
+
+type RPCMethod string
+
+const (
+	Ping RPCMethod = "ping"
+	Pong RPCMethod = "pong"
+)
+
+type RPCRequest struct {
+	Method RPCMethod
+	ConnID string
+}
+
+type Handler func(fd int) func() error
 
 func main() {
 	logger := zerolog.New(zerolog.ConsoleWriter{
@@ -27,18 +44,23 @@ func main() {
 		logger.Fatal().Msg("incorrect number of os arguments")
 	}
 
-	service := &Service{
-		stop:   &atomic.Bool{},
-		logger: &logger,
+	stop := &atomic.Bool{}
+
+	service := &PublicService{
+		stop:          stop,
+		handshakeReqC: make(chan string),
+		handshakeResC: make(map[string]chan int),
+		closeProxyFd:  make(map[string]chan struct{}),
+		logger:        &logger,
 	}
 
 	group := new(errgroup.Group)
 	switch os.Args[1] {
 	case "local":
-		group.Go(service.StartLocalServer)
+		group.Go(HandleLocalConnection)
 	case "public":
-		group.Go(service.StartIncomingServer)
-		group.Go(service.StartProxyServer)
+		group.Go(service.Listen(14600, service.HandleIncomingConnection, stop))
+		group.Go(service.Listen(22000, service.HandleLocalConnection, stop))
 	default:
 		logger.Fatal().Str("arg", os.Args[1]).Msg("unknown argument to start ttun")
 	}
@@ -48,98 +70,231 @@ func main() {
 	signalName := (<-interrupt).String()
 	logger.Debug().Str("signal", signalName).Msg("received os signal")
 
-	service.stop.Store(true)
+	stop.Store(true)
 
 	if err := group.Wait(); err != nil {
 		logger.Error().Err(err).Msg("failed to wait for threads")
 	}
 }
 
-type Service struct {
-	stop   *atomic.Bool
-	logger *zerolog.Logger
-}
-
-func (s *Service) StartLocalServer() error { return nil }
-
-func (s *Service) StartIncomingServer() error {
-	incomingSocketPort := 14600
-	incomingSocket, err := InitSocket()
+func HandleLocalConnection() error {
+	// todo: close fd
+	// todo: rewrite using syscalls
+	addr, err := net.ResolveTCPAddr("tcp", "172.17.0.3:22000")
+	// todo: check error
+	conn, err := net.DialTCP("tcp", nil, addr)
 	if err != nil {
-		return fmt.Errorf("failed to init incoming socket: %w", err)
+		return fmt.Errorf("failed to connect to the proxy server: %w", err)
 	}
-	if err = Listen(incomingSocket, incomingSocketPort); err != nil {
-		return fmt.Errorf("failed to listen incoming socket: %w", err)
-	}
-	// logger.Info().Int("port", incomingSocketPort).Msg("listen for incoming socket") // todo: set
 
-	// todo: how to wait and break array?
 	group := new(errgroup.Group)
+	// todo: how to exit loop below
 	for {
-		if s.stop.Load() {
-			// todo: make log
-			break
-		}
-
-		var nfd int // todo: rename
-		nfd, _, err = syscall.Accept(incomingSocket)
+		buf := make([]byte, 4096) // todo: buffer size
+		n, err := conn.Read(buf)
 		if err != nil {
-			if errors.Is(err, syscall.EAGAIN) {
-				fmt.Println("") // todo: delete
-				time.Sleep(time.Millisecond * 5)
-				continue
-			}
-			return fmt.Errorf("failed to accept new connection: %w", err)
+			return fmt.Errorf("failed to read from proxy server: %w", err)
 		}
-
-		conn := &Connection{
-			fd:     nfd,
-			logger: s.logger,
+		buf = buf[:n]
+		req := RPCRequest{}
+		if err = json.Unmarshal(buf, &req); err != nil {
+			return fmt.Errorf("failed to unmarshal new rpc request from proxy server: %w", err)
 		}
-		group.Go(conn.Handle)
+		// todo: check that method is ping
+		group.Go(NewProxyConnection(req.ConnID))
 	}
-	if err = group.Wait(); err != nil {
-		return fmt.Errorf("failed to wait for connections: %w", err)
-	}
-
-	return nil
+	// todo: uncomment
+	// if err = group.Wait(); err != nil {
+	// 	return fmt.Errorf("failed to wait for all proxy connections: %w", err)
+	// }
+	// return nil
 }
 
-func (s *Service) StartProxyServer() error {
-	// 22000
-	return nil
-}
+func NewProxyConnection(connID string) func() error {
+	// todo: remove nested
+	return func() error {
+		// todo: close connection to target and proxy
 
-type Connection struct {
-	fd int
-	// todo: store address of the connection inside logger
-	logger *zerolog.Logger
-}
-
-func (c *Connection) Handle() error {
-	defer func() {
-		if err := syscall.Close(c.fd); err != nil {
-			c.logger.Error().Err(err).Msg("failed to close connection")
-		}
-	}()
-
-	buffer := make([]byte, NetworkBufferSize)
-	for {
-		n, err := syscall.Read(c.fd, buffer)
+		proxyAdd, err := net.ResolveTCPAddr("tcp", "172.17.0.3:32345")
+		// todo: check error
+		proxyConn, err := net.DialTCP("tcp", nil, proxyAdd)
 		if err != nil {
-			if errors.Is(err, syscall.EAGAIN) {
-				time.Sleep(time.Millisecond * 5)
-				continue
+			return fmt.Errorf("failed to connect to the proxy server: %w", err)
+		}
+
+		req := RPCRequest{
+			Method: Pong,
+			ConnID: connID,
+		}
+		buf, err := json.Marshal(req)
+		// todo: check error
+		_, err = proxyConn.Write(buf)
+		if err != nil {
+			return fmt.Errorf("failed to write to proxy server: %w", err) // todo: adjust
+		}
+
+		targetAddr, err := net.ResolveTCPAddr("tcp", "172.17.0.2:44000")
+		// todo: check error
+		targetConn, err := net.DialTCP("tcp", nil, targetAddr)
+		if err != nil {
+			return fmt.Errorf("failed to connect to the target server: %w", err)
+		}
+
+		proxyFile, _ := proxyConn.File()
+		proxyFd := proxyFile.Fd()
+
+		targetFile, _ := targetConn.File()
+		targetFd := targetFile.Fd()
+
+		CopyStreams(proxyFd, targetFd)
+
+		return nil
+	}
+}
+
+// todo: comment why name is public service?
+type PublicService struct {
+	stop          *atomic.Bool
+	handshakeReqC chan string
+	handshakeResC map[string]chan int
+	closeProxyFd  map[string]chan struct{}
+	logger        *zerolog.Logger
+}
+
+func (s *PublicService) Listen(port int, handler Handler, stop *atomic.Bool) func() error {
+	// todo: remove nested
+	return func() error {
+		incomingSocket, err := InitSocket() // todo: rename
+		if err != nil {
+			return fmt.Errorf("failed to init incoming socket: %w", err) // todo: rename
+		}
+		if err = Listen(incomingSocket, port); err != nil {
+			return fmt.Errorf("failed to listen incoming socket: %w", err) // todo: rename
+		}
+		// logger.Info().Int("port", incomingSocketPort).Msg("listen for incoming socket") // todo: set // todo: rename
+
+		// todo: how to wait and break array?
+		group := new(errgroup.Group)
+		for {
+			if stop.Load() {
+				// todo: send to error group that everything should stopped
+				// todo: make log
+				break
 			}
-			return fmt.Errorf("failed to read from socket: %w", err)
+
+			var nfd int // todo: rename
+			nfd, _, err = syscall.Accept(incomingSocket)
+			if err != nil {
+				if errors.Is(err, syscall.EAGAIN) {
+					time.Sleep(time.Millisecond * 5)
+					continue
+				}
+				return fmt.Errorf("failed to accept new connection: %w", err)
+			}
+
+			group.Go(handler(nfd))
 		}
-		if n == 0 {
-			// todo: log that connection was closed
-			return nil
+		if err = group.Wait(); err != nil {
+			return fmt.Errorf("failed to wait for connections: %w", err)
 		}
-		if _, err = syscall.Write(c.fd, buffer[:n]); err != nil {
-			return fmt.Errorf("failed to write to the socket: %w", err)
+		return nil
+	}
+}
+
+func (s *PublicService) HandleIncomingConnection(fd int) func() error {
+	fmt.Println("new connection to incoming server") // todo: delete
+
+	// todo: remove nested
+	return func() error {
+		defer func() {
+			if err := syscall.Close(fd); err != nil {
+				s.logger.Error().Err(err).Msg("failed to close connection")
+			}
+		}()
+
+		connID := RandomString(12)
+		resC := make(chan int)         // todo: where to close this channel?
+		s.handshakeResC[connID] = resC // todo: how to clear map
+		s.handshakeReqC <- connID
+		fmt.Println("waiting for file descriptor to start copying streams") // todo: delete
+		nfd := <-resC                                                       // todo: rename
+		// todo: do we need to close nfd here?
+
+		fmt.Println("starting to copy streams") // todo: delete
+		CopyStreams(fd, nfd)
+
+		s.closeProxyFd[connID] <- struct{}{}
+
+		return nil
+	}
+}
+
+// todo: this function can be executed only once
+func (s *PublicService) HandleLocalConnection(fd int) func() error {
+	fmt.Println("new connection to from local side") // todo: delete
+
+	return func() error {
+		// todo: close fd on defer
+		group := new(errgroup.Group)
+		group.Go(s.Listen(32345, s.HandleProxyConnection, s.stop))
+
+		for {
+			handshakeConnID, ok := <-s.handshakeReqC // todo: where to close handshake channel?
+			if !ok {
+				// todo: how to close all proxy connections
+				break
+			}
+
+			req := RPCRequest{
+				Method: Ping,
+				ConnID: handshakeConnID,
+			}
+			buf, err := json.Marshal(req)
+			if err != nil {
+				return fmt.Errorf("failed to marshal ping rpc request: %w", err)
+			}
+			if _, err = syscall.Write(fd, buf); err != nil {
+				return fmt.Errorf("failed to write ping message to fd: %w", err)
+			}
 		}
+
+		if err := group.Wait(); err != nil {
+			return fmt.Errorf("failed to wait for server: %w", err)
+		}
+		return nil
+	}
+}
+
+func (s *PublicService) HandleProxyConnection(fd int) func() error {
+	fmt.Println("new connection to proxy server") // todo: delete
+
+	return func() error {
+		// todo: close fd on defer
+
+		buf := make([]byte, 4096) // todo: size
+		n, err := syscall.Read(fd, buf)
+		if err != nil {
+			return fmt.Errorf("failed to read from fd: %w", err)
+		}
+		req := RPCRequest{}
+		if err = json.Unmarshal(buf[:n], &req); err != nil {
+			return fmt.Errorf("failed to decode request: %w", err)
+		}
+		// todo: check that it is pong message
+
+		handshakeResC, ok := s.handshakeResC[req.ConnID]
+		if !ok {
+			// todo: very bad
+		}
+
+		closeC := make(chan struct{})
+		s.closeProxyFd[req.ConnID] = closeC
+		handshakeResC <- fd
+		fmt.Println("wait for closing proxy fd") // todo: delete
+		<-closeC
+		// todo: make log
+
+		return nil
 	}
 }
 
@@ -164,4 +319,48 @@ func Listen(fd, port int) error {
 		return fmt.Errorf("failed to listen: %w", err)
 	}
 	return nil
+}
+
+func RandomString(n int) string {
+	letterRunes := []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+	b := make([]rune, n)
+	for i := range b {
+		b[i] = letterRunes[rand.Intn(len(letterRunes))]
+	}
+	return string(b)
+}
+
+func CopyData[T int | uintptr](srcFd, dstFd T, errC chan error) {
+	buf := make([]byte, 4096) // todo: buffer size
+	for {
+		n, err := syscall.Read(int(srcFd), buf)
+		if err != nil {
+			if errors.Is(err, syscall.EAGAIN) {
+				time.Sleep(time.Millisecond * 5)
+				continue
+			}
+			errC <- fmt.Errorf("failed to read from source socket: %w", err)
+			return
+		}
+		if n == 0 {
+			// todo: make log
+			errC <- nil
+			return
+		}
+		if _, err = syscall.Write(int(dstFd), buf[:n]); err != nil {
+			errC <- fmt.Errorf("failed to write to destination socket: %w", err)
+			return
+		}
+	}
+}
+
+func CopyStreams[T int | uintptr](srcFd, dstFd T) {
+	errC := make(chan error)
+	go CopyData(srcFd, dstFd, errC)
+	go CopyData(dstFd, srcFd, errC)
+	for i := 0; i < 2; i++ {
+		if err := <-errC; err != nil {
+			// todo: make some log
+		}
+	}
 }
