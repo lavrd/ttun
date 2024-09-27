@@ -18,7 +18,14 @@ import (
 	"ttun/internal/logutils"
 )
 
-const NetworkBufferSize = 1024
+const NetworkBufferSize = 512
+
+// It is okay to use global variable as it is atomic
+// and we use it globally to stop all loops
+// and avoid using bypassing to every function.
+//
+//nolint:gochecknoglobals // see comment aboce
+var StopSignal = &atomic.Bool{}
 
 type RPCMethod string
 
@@ -32,7 +39,10 @@ type RPCRequest struct {
 	ConnID string
 }
 
-type Handler func(fd int) func() error
+type Handler interface {
+	ID() string
+	Handle(fd int, logger *slog.Logger) error
+}
 
 func main() {
 	handler := logutils.NewSlogHandler(os.Stdout, &slog.HandlerOptions{
@@ -46,22 +56,40 @@ func main() {
 		os.Exit(1)
 	}
 
-	stop := &atomic.Bool{}
-
-	service := &PublicService{
-		stop:          stop,
-		handshakeReqC: make(chan string),
-		handshakeResC: make(map[string]chan int),
-		closeProxyFd:  make(map[string]chan struct{}),
-	}
-
 	group := new(errgroup.Group)
 	switch os.Args[1] {
 	case "local":
-		group.Go(HandleLocalConnection)
+		group.Go(ConnectToProxy)
 	case "public":
-		group.Go(service.Listen(14600, service.HandleIncomingConnection, stop))
-		group.Go(service.Listen(22000, service.HandleLocalConnection, stop))
+		handshakeReqC := make(chan string)
+		handshakeResC := make(map[string]chan int)
+		closeProxyFd := make(map[string]chan struct{})
+
+		cl := &Listener[*ClientHandler]{
+			Port: 22000,
+			Handler: &ClientHandler{
+				handshakeReqC: handshakeReqC,
+			}}
+		group.Go(cl.Listen)
+
+		pl := &Listener[*ProxyHandler]{
+			Port: 32345,
+			Handler: &ProxyHandler{
+				handshakeResC: handshakeResC,
+				closeProxyFd:  closeProxyFd,
+			},
+		}
+		group.Go(pl.Listen)
+
+		il := &Listener[*IncomingHandler]{
+			Port: 14600,
+			Handler: &IncomingHandler{
+				handshakeReqC: handshakeReqC,
+				handshakeResC: handshakeResC,
+				closeProxyFd:  closeProxyFd,
+			},
+		}
+		group.Go(il.Listen)
 	default:
 		slog.Error("unknown argument to start ttun", "arg", os.Args[1])
 		os.Exit(1)
@@ -71,233 +99,270 @@ func main() {
 	signal.Notify(interrupt, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
 	signalName := (<-interrupt).String()
 	slog.Debug("received os signal", "signal", signalName)
-
-	stop.Store(true)
+	StopSignal.Store(true)
 
 	if err := group.Wait(); err != nil {
 		slog.Error("failed to wait for threads", "error", err)
 		os.Exit(1)
 	}
+
+	// todo: make log
 }
 
-func HandleLocalConnection() error {
-	// todo: close fd
-	// todo: rewrite using syscalls
+func ConnectToProxy() error {
 	addr, err := net.ResolveTCPAddr("tcp", "172.17.0.3:22000")
-	// todo: check error
+	if err != nil {
+		return fmt.Errorf("failed to resolve proxy address: %w", err)
+	}
 	conn, err := net.DialTCP("tcp", nil, addr)
 	if err != nil {
-		return fmt.Errorf("failed to connect to the proxy server: %w", err)
+		return fmt.Errorf("failed to connect to the proxy: %w", err)
 	}
+	defer func() {
+		if err = conn.Close(); err != nil {
+			slog.Error("failed to close socket with proxy", "error", err)
+		}
+	}()
+	slog.Debug("connected to proxy")
 
 	group := new(errgroup.Group)
 	// todo: how to exit loop below
 	for {
-		buf := make([]byte, 4096) // todo: buffer size
+		buf := make([]byte, NetworkBufferSize)
 		n, err := conn.Read(buf)
 		if err != nil {
-			return fmt.Errorf("failed to read from proxy server: %w", err)
+			return fmt.Errorf("failed to read from proxy: %w", err)
 		}
 		buf = buf[:n]
+
 		req := RPCRequest{}
 		if err = json.Unmarshal(buf, &req); err != nil {
 			return fmt.Errorf("failed to unmarshal new rpc request from proxy server: %w", err)
 		}
 		// todo: check that method is ping
-		group.Go(NewProxyConnection(req.ConnID))
+		slog.Debug("new rpc request from proxy", "request", req)
+
+		conn := &ProxyConnection{ConnID: req.ConnID}
+		group.Go(conn.Init)
 	}
 	// todo: uncomment
 	// if err = group.Wait(); err != nil {
 	// 	return fmt.Errorf("failed to wait for all proxy connections: %w", err)
 	// }
+
 	// return nil
 }
 
-func NewProxyConnection(connID string) func() error {
-	// todo: remove nested
-	return func() error {
-		// todo: close connection to target and proxy
+type ProxyConnection struct {
+	ConnID string
+}
 
-		proxyAdd, err := net.ResolveTCPAddr("tcp", "172.17.0.3:32345")
-		// todo: check error
-		proxyConn, err := net.DialTCP("tcp", nil, proxyAdd)
-		if err != nil {
-			return fmt.Errorf("failed to connect to the proxy server: %w", err)
+func (c *ProxyConnection) Init() error {
+	logger := slog.With("conn_id", c.ConnID)
+	logger.Debug("proxy requested new connection")
+
+	proxyAddr, err := net.ResolveTCPAddr("tcp", "172.17.0.3:32345")
+	if err != nil {
+		return fmt.Errorf("failed to resolve proxy address: %w", err)
+	}
+	proxyConn, err := net.DialTCP("tcp", nil, proxyAddr)
+	if err != nil {
+		return fmt.Errorf("failed to connect to the proxy: %w", err)
+	}
+	defer func() {
+		if err = proxyConn.Close(); err != nil {
+			logger.Error("failed to close proxy connection", "error", err)
 		}
+	}()
 
+	req := RPCRequest{
+		Method: Pong,
+		ConnID: c.ConnID,
+	}
+	buf, err := json.Marshal(req)
+	if err != nil {
+		return fmt.Errorf("failed to encode rpc request: %w", err)
+	}
+	if _, err = proxyConn.Write(buf); err != nil {
+		return fmt.Errorf("failed to write to proxy rpc request: %w", err)
+	}
+
+	targetAddr, err := net.ResolveTCPAddr("tcp", "172.17.0.2:44000")
+	if err != nil {
+		return fmt.Errorf("failed to resolve target address: %w", err)
+	}
+	targetConn, err := net.DialTCP("tcp", nil, targetAddr)
+	if err != nil {
+		return fmt.Errorf("failed to connect to the target: %w", err)
+	}
+	defer func() {
+		if err = targetConn.Close(); err != nil {
+			logger.Error("failed to close target connection", "error", err)
+		}
+	}()
+
+	proxyFile, err := proxyConn.File()
+	if err != nil {
+		return fmt.Errorf("failed to get proxy fd: %w", err)
+	}
+	proxyFd := proxyFile.Fd()
+
+	targetFile, err := targetConn.File()
+	if err != nil {
+		return fmt.Errorf("failed to get target fd: %w", err)
+	}
+	targetFd := targetFile.Fd()
+
+	logger.Debug("start copy streams")
+	if err = CopyStreams(proxyFd, targetFd); err != nil {
+		return fmt.Errorf("failed to copy streams: %w", err)
+	}
+
+	return nil
+}
+
+type Listener[T Handler] struct {
+	Port    int
+	Handler T
+}
+
+func (l *Listener[T]) Listen() error {
+	logger := slog.With("id", l.Handler.ID())
+
+	socket, err := InitSocket()
+	if err != nil {
+		return fmt.Errorf("failed to init socket: %w", err)
+	}
+	if err = Listen(socket, l.Port); err != nil {
+		return fmt.Errorf("failed to listen socket: %w", err)
+	}
+	logger.Debug("listen for connections to socket", "port", l.Port)
+
+	group := new(errgroup.Group)
+	for {
+		if StopSignal.Load() {
+			logger.Debug("break listen array because of stop signal")
+			break
+		}
+		var fd int
+		var addr syscall.Sockaddr
+		fd, addr, err = syscall.Accept(socket)
+		if err != nil {
+			if errors.Is(err, syscall.EAGAIN) {
+				time.Sleep(time.Millisecond * 5)
+				continue
+			}
+			return fmt.Errorf("failed to accept new connection: %w", err)
+		}
+		group.Go(InitHandler(fd, addr, l.Handler, logger))
+	}
+	if err = group.Wait(); err != nil {
+		return fmt.Errorf("failed to wait for connections: %w", err)
+	}
+
+	return nil
+}
+
+type ClientHandler struct {
+	handshakeReqC chan string
+}
+
+func (h *ClientHandler) ID() string { return "client-handler" }
+
+// todo: make sure we have only one active connection there
+func (h *ClientHandler) Handle(fd int, logger *slog.Logger) error {
+	for {
+		// todo: where to close handshake channel?
+		connID, ok := <-h.handshakeReqC
+		if !ok {
+			// todo: how to close all proxy connections?
+			// todo: do we need to close all proxy connectiond?
+			logger.Debug("handshake request channel was closed")
+			break
+		}
+		logger = logger.With("conn_id", connID)
+		logger.Debug("received new handshake")
 		req := RPCRequest{
-			Method: Pong,
+			Method: Ping,
 			ConnID: connID,
 		}
 		buf, err := json.Marshal(req)
-		// todo: check error
-		_, err = proxyConn.Write(buf)
 		if err != nil {
-			return fmt.Errorf("failed to write to proxy server: %w", err) // todo: adjust
+			return fmt.Errorf("failed to encode ping rpc request: %w", err)
 		}
-
-		targetAddr, err := net.ResolveTCPAddr("tcp", "172.17.0.2:44000")
-		// todo: check error
-		targetConn, err := net.DialTCP("tcp", nil, targetAddr)
-		if err != nil {
-			return fmt.Errorf("failed to connect to the target server: %w", err)
+		if _, err = syscall.Write(fd, buf); err != nil {
+			return fmt.Errorf("failed to write ping message to fd: %w", err)
 		}
-
-		proxyFile, _ := proxyConn.File()
-		proxyFd := proxyFile.Fd()
-
-		targetFile, _ := targetConn.File()
-		targetFd := targetFile.Fd()
-
-		CopyStreams(proxyFd, targetFd)
-
-		return nil
+		logger.Debug("rpc request to client was sent")
 	}
+	return nil
 }
 
-// todo: comment why name is public service?
-type PublicService struct {
-	stop          *atomic.Bool
+type ProxyHandler struct {
+	handshakeResC map[string]chan int
+	closeProxyFd  map[string]chan struct{}
+}
+
+func (h *ProxyHandler) ID() string { return "proxy-handler" }
+
+func (h *ProxyHandler) Handle(fd int, _ *slog.Logger) error {
+	buf := make([]byte, NetworkBufferSize)
+	n, err := syscall.Read(fd, buf)
+	if err != nil {
+		return fmt.Errorf("failed to read from fd: %w", err)
+	}
+	req := RPCRequest{}
+	if err = json.Unmarshal(buf[:n], &req); err != nil {
+		return fmt.Errorf("failed to decode request: %w", err)
+	}
+	// todo: check that it is pong message
+
+	handshakeResC, ok := h.handshakeResC[req.ConnID]
+	if !ok {
+		// todo: very bad
+	}
+
+	closeC := make(chan struct{})
+	h.closeProxyFd[req.ConnID] = closeC
+	// todo: who should close and delete this channel from map?
+	handshakeResC <- fd
+	// todo: who should close and delete this channel from map?
+	// todo: check that it is not closed
+	<-closeC
+
+	// todo: make log
+
+	return nil
+}
+
+type IncomingHandler struct {
 	handshakeReqC chan string
 	handshakeResC map[string]chan int
 	closeProxyFd  map[string]chan struct{}
 }
 
-func (s *PublicService) Listen(port int, handler Handler, stop *atomic.Bool) func() error {
-	// todo: remove nested
-	return func() error {
-		incomingSocket, err := InitSocket() // todo: rename
-		if err != nil {
-			return fmt.Errorf("failed to init incoming socket: %w", err) // todo: rename
-		}
-		if err = Listen(incomingSocket, port); err != nil {
-			return fmt.Errorf("failed to listen incoming socket: %w", err) // todo: rename
-		}
-		// logger.Info().Int("port", incomingSocketPort).Msg("listen for incoming socket") // todo: set // todo: rename
+func (h *IncomingHandler) ID() string { return "incoming-handler" }
 
-		// todo: how to wait and break array?
-		group := new(errgroup.Group)
-		for {
-			if stop.Load() {
-				// todo: send to error group that everything should stopped
-				// todo: make log
-				break
-			}
+func (h *IncomingHandler) Handle(fd int, logger *slog.Logger) error {
+	connID := RandomString(12)
+	logger = logger.With("conn_id", connID)
 
-			var nfd int // todo: rename
-			nfd, _, err = syscall.Accept(incomingSocket)
-			if err != nil {
-				if errors.Is(err, syscall.EAGAIN) {
-					time.Sleep(time.Millisecond * 5)
-					continue
-				}
-				return fmt.Errorf("failed to accept new connection: %w", err)
-			}
+	resC := make(chan int)         // todo: where to close this channel?
+	h.handshakeResC[connID] = resC // todo: how to clear map
 
-			group.Go(handler(nfd))
-		}
-		if err = group.Wait(); err != nil {
-			return fmt.Errorf("failed to wait for connections: %w", err)
-		}
-		return nil
+	h.handshakeReqC <- connID
+	logger.Debug("handshake request was sent")
+	nfd := <-resC // todo: rename
+	// todo: do we need to close nfd here?
+	logger.Debug("received client fd", "nfd", nfd)
+
+	if err := CopyStreams(fd, nfd); err != nil {
+		h.closeProxyFd[connID] <- struct{}{}
+		return fmt.Errorf("failed to copy streams: %w", err)
 	}
-}
+	h.closeProxyFd[connID] <- struct{}{}
 
-func (s *PublicService) HandleIncomingConnection(fd int) func() error {
-	fmt.Println("new connection to incoming server") // todo: delete
-
-	// todo: remove nested
-	return func() error {
-		defer func() {
-			if err := syscall.Close(fd); err != nil {
-				slog.Error("failed to close connection", "error", err)
-			}
-		}()
-
-		connID := RandomString(12)
-		resC := make(chan int)         // todo: where to close this channel?
-		s.handshakeResC[connID] = resC // todo: how to clear map
-		s.handshakeReqC <- connID
-		fmt.Println("waiting for file descriptor to start copying streams") // todo: delete
-		nfd := <-resC                                                       // todo: rename
-		// todo: do we need to close nfd here?
-
-		fmt.Println("starting to copy streams") // todo: delete
-		CopyStreams(fd, nfd)
-
-		s.closeProxyFd[connID] <- struct{}{}
-
-		return nil
-	}
-}
-
-// todo: this function can be executed only once
-func (s *PublicService) HandleLocalConnection(fd int) func() error {
-	fmt.Println("new connection to from local side") // todo: delete
-
-	return func() error {
-		// todo: close fd on defer
-		group := new(errgroup.Group)
-		group.Go(s.Listen(32345, s.HandleProxyConnection, s.stop))
-
-		for {
-			handshakeConnID, ok := <-s.handshakeReqC // todo: where to close handshake channel?
-			if !ok {
-				// todo: how to close all proxy connections
-				break
-			}
-
-			req := RPCRequest{
-				Method: Ping,
-				ConnID: handshakeConnID,
-			}
-			buf, err := json.Marshal(req)
-			if err != nil {
-				return fmt.Errorf("failed to marshal ping rpc request: %w", err)
-			}
-			if _, err = syscall.Write(fd, buf); err != nil {
-				return fmt.Errorf("failed to write ping message to fd: %w", err)
-			}
-		}
-
-		if err := group.Wait(); err != nil {
-			return fmt.Errorf("failed to wait for server: %w", err)
-		}
-		return nil
-	}
-}
-
-func (s *PublicService) HandleProxyConnection(fd int) func() error {
-	fmt.Println("new connection to proxy server") // todo: delete
-
-	return func() error {
-		// todo: close fd on defer
-
-		buf := make([]byte, 4096) // todo: size
-		n, err := syscall.Read(fd, buf)
-		if err != nil {
-			return fmt.Errorf("failed to read from fd: %w", err)
-		}
-		req := RPCRequest{}
-		if err = json.Unmarshal(buf[:n], &req); err != nil {
-			return fmt.Errorf("failed to decode request: %w", err)
-		}
-		// todo: check that it is pong message
-
-		handshakeResC, ok := s.handshakeResC[req.ConnID]
-		if !ok {
-			// todo: very bad
-		}
-
-		closeC := make(chan struct{})
-		s.closeProxyFd[req.ConnID] = closeC
-		handshakeResC <- fd
-		fmt.Println("wait for closing proxy fd") // todo: delete
-		<-closeC
-		// todo: make log
-
-		return nil
-	}
+	return nil
 }
 
 func InitSocket() (int, error) {
@@ -323,17 +388,9 @@ func Listen(fd, port int) error {
 	return nil
 }
 
-func RandomString(n int) string {
-	letterRunes := []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
-	b := make([]rune, n)
-	for i := range b {
-		b[i] = letterRunes[rand.Intn(len(letterRunes))]
-	}
-	return string(b)
-}
-
 func CopyData[T int | uintptr](srcFd, dstFd T, errC chan error) {
-	buf := make([]byte, 4096) // todo: buffer size
+	logger := slog.With("src_fd", srcFd, "dst_fd", dstFd)
+	buf := make([]byte, NetworkBufferSize)
 	for {
 		n, err := syscall.Read(int(srcFd), buf)
 		if err != nil {
@@ -341,28 +398,66 @@ func CopyData[T int | uintptr](srcFd, dstFd T, errC chan error) {
 				time.Sleep(time.Millisecond * 5)
 				continue
 			}
-			errC <- fmt.Errorf("failed to read from source socket: %w", err)
+			errC <- SpawnCopyDataErr("failed to read from source socket", err, srcFd, dstFd)
 			return
 		}
 		if n == 0 {
-			// todo: make log
+			logger.Debug("connection with source socket is closed")
 			errC <- nil
 			return
 		}
 		if _, err = syscall.Write(int(dstFd), buf[:n]); err != nil {
-			errC <- fmt.Errorf("failed to write to destination socket: %w", err)
+			errC <- SpawnCopyDataErr("failed to write to destination socket", err, srcFd, dstFd)
 			return
 		}
 	}
 }
 
-func CopyStreams[T int | uintptr](srcFd, dstFd T) {
+func SpawnCopyDataErr[T int | uintptr](message string, err error, srcFd, dstFd T) error {
+	return fmt.Errorf("%s: src_fd=%d;dst_fd=%d: %w", message, srcFd, dstFd, err)
+}
+
+func CopyStreams[T int | uintptr](srcFd, dstFd T) error {
 	errC := make(chan error)
 	go CopyData(srcFd, dstFd, errC)
 	go CopyData(dstFd, srcFd, errC)
+	var lastErr error
 	for i := 0; i < 2; i++ {
 		if err := <-errC; err != nil {
-			// todo: make some log
+			lastErr = err
 		}
 	}
+	return lastErr
+}
+
+func InitHandler(
+	fd int, addr syscall.Sockaddr,
+	handler Handler,
+	logger *slog.Logger,
+) func() error {
+
+	return func() error {
+		connLogger := logger.With("fd", fd, "addr", addr)
+		connLogger.Debug("new connection")
+		defer func() {
+			if err := syscall.Close(fd); err != nil {
+				connLogger.Error("failed to close fd", "error", err)
+				return
+			}
+			connLogger.Debug("fd closed")
+		}()
+		if err := handler.Handle(fd, connLogger); err != nil {
+			return fmt.Errorf("failed to handle: %w", err)
+		}
+		return nil
+	}
+}
+
+func RandomString(n int) string {
+	letterRunes := []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+	b := make([]rune, n)
+	for i := range b {
+		b[i] = letterRunes[rand.Intn(len(letterRunes))]
+	}
+	return string(b)
 }
