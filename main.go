@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/rand"
 	"net"
 	"os"
@@ -12,8 +13,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/rs/zerolog"
 	"golang.org/x/sync/errgroup"
+
+	"ttun/internal/logutils"
 )
 
 const NetworkBufferSize = 1024
@@ -33,15 +35,15 @@ type RPCRequest struct {
 type Handler func(fd int) func() error
 
 func main() {
-	logger := zerolog.New(zerolog.ConsoleWriter{
-		Out:        os.Stdout,
-		TimeFormat: time.RFC3339,
-	}).
-		With().Timestamp().Caller().
-		Logger().Level(zerolog.TraceLevel)
+	handler := logutils.NewSlogHandler(os.Stdout, &slog.HandlerOptions{
+		Level:     slog.LevelDebug,
+		AddSource: true,
+	})
+	slog.SetDefault(slog.New(handler))
 
 	if len(os.Args) != 2 {
-		logger.Fatal().Msg("incorrect number of os arguments")
+		slog.Error("incorrect number of os arguments", "length", len(os.Args)-1)
+		os.Exit(1)
 	}
 
 	stop := &atomic.Bool{}
@@ -51,7 +53,6 @@ func main() {
 		handshakeReqC: make(chan string),
 		handshakeResC: make(map[string]chan int),
 		closeProxyFd:  make(map[string]chan struct{}),
-		logger:        &logger,
 	}
 
 	group := new(errgroup.Group)
@@ -62,18 +63,20 @@ func main() {
 		group.Go(service.Listen(14600, service.HandleIncomingConnection, stop))
 		group.Go(service.Listen(22000, service.HandleLocalConnection, stop))
 	default:
-		logger.Fatal().Str("arg", os.Args[1]).Msg("unknown argument to start ttun")
+		slog.Error("unknown argument to start ttun", "arg", os.Args[1])
+		os.Exit(1)
 	}
 
 	interrupt := make(chan os.Signal, 1)
 	signal.Notify(interrupt, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
 	signalName := (<-interrupt).String()
-	logger.Debug().Str("signal", signalName).Msg("received os signal")
+	slog.Debug("received os signal", "signal", signalName)
 
 	stop.Store(true)
 
 	if err := group.Wait(); err != nil {
-		logger.Error().Err(err).Msg("failed to wait for threads")
+		slog.Error("failed to wait for threads", "error", err)
+		os.Exit(1)
 	}
 }
 
@@ -158,7 +161,6 @@ type PublicService struct {
 	handshakeReqC chan string
 	handshakeResC map[string]chan int
 	closeProxyFd  map[string]chan struct{}
-	logger        *zerolog.Logger
 }
 
 func (s *PublicService) Listen(port int, handler Handler, stop *atomic.Bool) func() error {
@@ -208,7 +210,7 @@ func (s *PublicService) HandleIncomingConnection(fd int) func() error {
 	return func() error {
 		defer func() {
 			if err := syscall.Close(fd); err != nil {
-				s.logger.Error().Err(err).Msg("failed to close connection")
+				slog.Error("failed to close connection", "error", err)
 			}
 		}()
 
