@@ -18,7 +18,7 @@ import (
 	"ttun/internal/rpc"
 )
 
-const NetworkBufferSize = 64
+const NetworkBufferSize = 128
 
 // It is okay to use global variable as it is atomic,
 // and we use it globally to stop all loops
@@ -33,11 +33,13 @@ type Handler interface {
 }
 
 func main() {
-	handler := logutils.NewSlogHandler(os.Stdout, &slog.HandlerOptions{
-		Level:     slog.LevelDebug,
-		AddSource: true,
-	})
-	slog.SetDefault(slog.New(handler))
+	slogHandler := logutils.NewSlogHandler(
+		os.Stdout,
+		&slog.HandlerOptions{
+			Level:     slog.LevelDebug,
+			AddSource: true,
+		})
+	slog.SetDefault(slog.New(slogHandler))
 
 	if len(os.Args) != 2 {
 		slog.Error("incorrect number of os arguments", "length", len(os.Args)-1)
@@ -47,22 +49,24 @@ func main() {
 	group := new(errgroup.Group)
 	switch os.Args[1] {
 	case "local":
-		group.Go(ConnectToProxy)
+		conn := &ProxyConnection{}
+		group.Go(conn.Connect)
 	case "public":
 		handshakeReqC := make(chan string)
 		handshakeResC := make(map[string]chan int)
 		closeProxyFd := make(map[string]chan struct{})
 
 		cl := &Listener[*ClientHandler]{
-			Port: 22000,
-			Handler: &ClientHandler{
+			port: 22000,
+			handler: &ClientHandler{
 				handshakeReqC: handshakeReqC,
-			}}
+			},
+		}
 		group.Go(cl.Listen)
 
 		pl := &Listener[*ProxyHandler]{
-			Port: 32345,
-			Handler: &ProxyHandler{
+			port: 32345,
+			handler: &ProxyHandler{
 				handshakeResC: handshakeResC,
 				closeProxyFd:  closeProxyFd,
 			},
@@ -70,8 +74,8 @@ func main() {
 		group.Go(pl.Listen)
 
 		il := &Listener[*IncomingHandler]{
-			Port: 14600,
-			Handler: &IncomingHandler{
+			port: 14600,
+			handler: &IncomingHandler{
 				handshakeReqC: handshakeReqC,
 				handshakeResC: handshakeResC,
 				closeProxyFd:  closeProxyFd,
@@ -97,7 +101,9 @@ func main() {
 	// todo: make log
 }
 
-func ConnectToProxy() error {
+type ProxyConnection struct{}
+
+func (c *ProxyConnection) Connect() error {
 	addr, err := net.ResolveTCPAddr("tcp", "172.17.0.3:22000")
 	if err != nil {
 		return fmt.Errorf("failed to resolve proxy address: %w", err)
@@ -130,7 +136,7 @@ func ConnectToProxy() error {
 		// todo: check that method is ping
 		slog.Debug("new rpc request from proxy", "request", req)
 
-		conn := &ProxyConnection{ConnID: req.ConnID}
+		conn := &IncomingConnection{connID: req.ConnID}
 		group.Go(conn.Init)
 	}
 	// todo: uncomment
@@ -141,12 +147,12 @@ func ConnectToProxy() error {
 	// return nil
 }
 
-type ProxyConnection struct {
-	ConnID string
+type IncomingConnection struct {
+	connID string
 }
 
-func (c *ProxyConnection) Init() error {
-	logger := slog.With("conn_id", c.ConnID)
+func (c *IncomingConnection) Init() error {
+	logger := slog.With("conn_id", c.connID)
 	logger.Debug("proxy requested new connection")
 
 	proxyAddr, err := net.ResolveTCPAddr("tcp", "172.17.0.3:32345")
@@ -165,7 +171,7 @@ func (c *ProxyConnection) Init() error {
 
 	req := rpc.Request{
 		Method: rpc.Pong,
-		ConnID: c.ConnID,
+		ConnID: c.connID,
 	}
 	buf := req.Encode()
 	if _, err = proxyConn.Write(buf); err != nil {
@@ -207,21 +213,21 @@ func (c *ProxyConnection) Init() error {
 }
 
 type Listener[T Handler] struct {
-	Port    int
-	Handler T
+	port    int
+	handler T
 }
 
 func (l *Listener[T]) Listen() error {
-	logger := slog.With("id", l.Handler.ID())
+	logger := slog.With("id", l.handler.ID())
 
 	socket, err := InitSocket()
 	if err != nil {
 		return fmt.Errorf("failed to init socket: %w", err)
 	}
-	if err = Listen(socket, l.Port); err != nil {
+	if err = Listen(socket, l.port); err != nil {
 		return fmt.Errorf("failed to listen socket: %w", err)
 	}
-	logger.Debug("listen for connections to socket", "port", l.Port)
+	logger.Debug("listen for connections to socket", "port", l.port)
 
 	group := new(errgroup.Group)
 	for {
@@ -239,7 +245,7 @@ func (l *Listener[T]) Listen() error {
 			}
 			return fmt.Errorf("failed to accept new connection: %w", err)
 		}
-		group.Go(InitHandler(fd, addr, l.Handler, logger))
+		group.Go(InitHandler(fd, addr, l.handler, logger))
 	}
 	if err = group.Wait(); err != nil {
 		return fmt.Errorf("failed to wait for connections: %w", err)
@@ -419,7 +425,7 @@ func InitHandler(
 ) func() error {
 
 	return func() error {
-		connLogger := logger.With("fd", fd, "addr", addr)
+		connLogger := logger.With("fd", fd, "addr", SockaddrToString(addr))
 		connLogger.Debug("new connection")
 		defer func() {
 			if err := syscall.Close(fd); err != nil {
@@ -442,4 +448,14 @@ func RandomString(n int) string {
 		b[i] = letterRunes[rand.Intn(len(letterRunes))]
 	}
 	return string(b)
+}
+
+func SockaddrToString(sa syscall.Sockaddr) string {
+	switch v := sa.(type) {
+	case *syscall.SockaddrInet4:
+		ip := net.IPv4(v.Addr[0], v.Addr[1], v.Addr[2], v.Addr[3])
+		return fmt.Sprintf("%s:%d", ip.String(), v.Port)
+	default:
+		return "unknown address"
+	}
 }

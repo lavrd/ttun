@@ -6,9 +6,8 @@ import (
 	"io"
 	"log"
 	"log/slog"
+	"time"
 )
-
-const MessageDelimiter = "|"
 
 type CtxKey string
 
@@ -40,15 +39,25 @@ func (h *SlogHandler) Handle(ctx context.Context, r slog.Record) error {
 		fields[a.Key] = a.Value.Any()
 		return true
 	})
-	attrs := []byte(MessageDelimiter + " ")
+	attrs := []byte(" ")
 	for key, value := range fields {
-		attrs = append(attrs, []byte(fmt.Sprintf(`%s="%s"; `, key, value))...)
+		attrs = append(attrs, []byte(fmt.Sprintf(`%s="%v"; `, key, value))...)
 	}
-	attrs = attrs[:len(attrs)-2]
-	timeStr := r.Time.Format("[15:05:05.000]")
-	level := r.Level.String() + " " + MessageDelimiter
+	// If there are no attributes this byte array is empty.
+	if len(attrs) != 1 {
+		attrs = attrs[:len(attrs)-2] // remove last semicolon and space
+	}
+	timeStr := r.Time.Format(time.RFC3339)
+	level := r.Level.String() + " "
 	h.l.Println(timeStr, level, r.Message, string(attrs))
 	return nil
+}
+
+func (h *SlogHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return &SlogHandler{
+		Handler: h.Handler,
+		l:       h.l,
+	}
 }
 
 func CtxWithAttr(ctx context.Context, attr slog.Attr) context.Context {
