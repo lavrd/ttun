@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/alecthomas/kong"
 	"golang.org/x/sync/errgroup"
 
 	"ttun/internal/logutils"
@@ -32,6 +33,65 @@ type Handler interface {
 	Handle(fd int, logger *slog.Logger) error
 }
 
+type ClientCmd struct{}
+
+func (cmd *ClientCmd) Run() error {
+	conn := &ProxyConnection{}
+	group := new(errgroup.Group)
+	group.Go(conn.Connect)
+	WaitSignal()
+	if err := group.Wait(); err != nil {
+		return fmt.Errorf("failed to wait for goroutines: %w", err)
+	}
+	return nil
+}
+
+type ServerCmd struct{}
+
+func (cmd *ServerCmd) Run() error {
+	handshakeReqC := make(chan string)
+	handshakeResC := make(map[string]chan int)
+	closeProxyFd := make(map[string]chan struct{})
+
+	cl := &Listener[*ClientHandler]{
+		port: 22000,
+		handler: &ClientHandler{
+			handshakeReqC: handshakeReqC,
+		},
+	}
+	pl := &Listener[*ProxyHandler]{
+		port: 32345,
+		handler: &ProxyHandler{
+			handshakeResC: handshakeResC,
+			closeProxyFd:  closeProxyFd,
+		},
+	}
+	il := &Listener[*IncomingHandler]{
+		port: 14600,
+		handler: &IncomingHandler{
+			handshakeReqC: handshakeReqC,
+			handshakeResC: handshakeResC,
+			closeProxyFd:  closeProxyFd,
+		},
+	}
+
+	group := new(errgroup.Group)
+	group.Go(cl.Listen)
+	group.Go(pl.Listen)
+	group.Go(il.Listen)
+	WaitSignal()
+	if err := group.Wait(); err != nil {
+		return fmt.Errorf("failed to wait for goroutines: %w", err)
+	}
+
+	return nil
+}
+
+type CLI struct {
+	Client ClientCmd `cmd:"" help:"Start client side."`
+	Server ServerCmd `cmd:"" help:"Start server side."`
+}
+
 func main() {
 	slogHandler := logutils.NewSlogHandler(
 		os.Stdout,
@@ -41,64 +101,11 @@ func main() {
 		})
 	slog.SetDefault(slog.New(slogHandler))
 
-	if len(os.Args) != 2 {
-		slog.Error("incorrect number of os arguments", "length", len(os.Args)-1)
+	kongCtx := kong.Parse(&CLI{})
+	if err := kongCtx.Run(); err != nil {
+		slog.Error("failed to run command", "error", err)
 		os.Exit(1)
 	}
-
-	group := new(errgroup.Group)
-	switch os.Args[1] {
-	case "client":
-		conn := &ProxyConnection{}
-		group.Go(conn.Connect)
-	case "server":
-		handshakeReqC := make(chan string)
-		handshakeResC := make(map[string]chan int)
-		closeProxyFd := make(map[string]chan struct{})
-
-		cl := &Listener[*ClientHandler]{
-			port: 22000,
-			handler: &ClientHandler{
-				handshakeReqC: handshakeReqC,
-			},
-		}
-		group.Go(cl.Listen)
-
-		pl := &Listener[*ProxyHandler]{
-			port: 32345,
-			handler: &ProxyHandler{
-				handshakeResC: handshakeResC,
-				closeProxyFd:  closeProxyFd,
-			},
-		}
-		group.Go(pl.Listen)
-
-		il := &Listener[*IncomingHandler]{
-			port: 14600,
-			handler: &IncomingHandler{
-				handshakeReqC: handshakeReqC,
-				handshakeResC: handshakeResC,
-				closeProxyFd:  closeProxyFd,
-			},
-		}
-		group.Go(il.Listen)
-	default:
-		slog.Error("unknown argument to start ttun", "arg", os.Args[1])
-		os.Exit(1)
-	}
-
-	interrupt := make(chan os.Signal, 1)
-	signal.Notify(interrupt, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
-	signalName := (<-interrupt).String()
-	slog.Debug("received os signal", "signal", signalName)
-	StopSignal.Store(true)
-
-	if err := group.Wait(); err != nil {
-		slog.Error("failed to wait for threads", "error", err)
-		os.Exit(1)
-	}
-
-	// todo: make log
 }
 
 type ProxyConnection struct{}
@@ -458,4 +465,12 @@ func SockaddrToString(sa syscall.Sockaddr) string {
 	default:
 		return "unknown address"
 	}
+}
+
+func WaitSignal() {
+	interrupt := make(chan os.Signal, 1)
+	signal.Notify(interrupt, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
+	signalName := (<-interrupt).String()
+	slog.Debug("received os signal", "signal", signalName)
+	StopSignal.Store(true)
 }
