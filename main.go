@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -16,28 +15,17 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"ttun/internal/logutils"
+	"ttun/internal/rpc"
 )
 
-const NetworkBufferSize = 512
+const NetworkBufferSize = 64
 
-// It is okay to use global variable as it is atomic
+// It is okay to use global variable as it is atomic,
 // and we use it globally to stop all loops
 // and avoid using bypassing to every function.
 //
-//nolint:gochecknoglobals // see comment aboce
+//nolint:gochecknoglobals // see comment above
 var StopSignal = &atomic.Bool{}
-
-type RPCMethod string
-
-const (
-	Ping RPCMethod = "ping"
-	Pong RPCMethod = "pong"
-)
-
-type RPCRequest struct {
-	Method RPCMethod
-	ConnID string
-}
 
 type Handler interface {
 	ID() string
@@ -135,9 +123,9 @@ func ConnectToProxy() error {
 		}
 		buf = buf[:n]
 
-		req := RPCRequest{}
-		if err = json.Unmarshal(buf, &req); err != nil {
-			return fmt.Errorf("failed to unmarshal new rpc request from proxy server: %w", err)
+		req := rpc.Request{}
+		if err := req.Decode(buf); err != nil {
+			return fmt.Errorf("failed to decode new rpc request from proxy: %w", err)
 		}
 		// todo: check that method is ping
 		slog.Debug("new rpc request from proxy", "request", req)
@@ -175,14 +163,11 @@ func (c *ProxyConnection) Init() error {
 		}
 	}()
 
-	req := RPCRequest{
-		Method: Pong,
+	req := rpc.Request{
+		Method: rpc.Pong,
 		ConnID: c.ConnID,
 	}
-	buf, err := json.Marshal(req)
-	if err != nil {
-		return fmt.Errorf("failed to encode rpc request: %w", err)
-	}
+	buf := req.Encode()
 	if _, err = proxyConn.Write(buf); err != nil {
 		return fmt.Errorf("failed to write to proxy rpc request: %w", err)
 	}
@@ -276,21 +261,18 @@ func (h *ClientHandler) Handle(fd int, logger *slog.Logger) error {
 		connID, ok := <-h.handshakeReqC
 		if !ok {
 			// todo: how to close all proxy connections?
-			// todo: do we need to close all proxy connectiond?
+			// todo: do we need to close all proxy connections?
 			logger.Debug("handshake request channel was closed")
 			break
 		}
 		logger = logger.With("conn_id", connID)
 		logger.Debug("received new handshake")
-		req := RPCRequest{
-			Method: Ping,
+		req := rpc.Request{
+			Method: rpc.Ping,
 			ConnID: connID,
 		}
-		buf, err := json.Marshal(req)
-		if err != nil {
-			return fmt.Errorf("failed to encode ping rpc request: %w", err)
-		}
-		if _, err = syscall.Write(fd, buf); err != nil {
+		buf := req.Encode()
+		if _, err := syscall.Write(fd, buf); err != nil {
 			return fmt.Errorf("failed to write ping message to fd: %w", err)
 		}
 		logger.Debug("rpc request to client was sent")
@@ -311,8 +293,8 @@ func (h *ProxyHandler) Handle(fd int, _ *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("failed to read from fd: %w", err)
 	}
-	req := RPCRequest{}
-	if err = json.Unmarshal(buf[:n], &req); err != nil {
+	req := rpc.Request{}
+	if err = req.Decode(buf[:n]); err != nil {
 		return fmt.Errorf("failed to decode request: %w", err)
 	}
 	// todo: check that it is pong message

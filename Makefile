@@ -14,7 +14,7 @@ build_docker: build
 	docker build -t ttun -f Dockerfile .
 
 test:
-	go test -timeout 1m -v -count 1
+	go test ./... -timeout 1m -v -count 1
 
 run_docker_local:
 	docker run --rm -it \

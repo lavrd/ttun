@@ -8,7 +8,7 @@ import (
 	"log/slog"
 )
 
-const MessageDelimeter = "|"
+const MessageDelimiter = "|"
 
 type CtxKey string
 
@@ -40,13 +40,13 @@ func (h *SlogHandler) Handle(ctx context.Context, r slog.Record) error {
 		fields[a.Key] = a.Value.Any()
 		return true
 	})
-	attrs := []byte(MessageDelimeter + " ")
+	attrs := []byte(MessageDelimiter + " ")
 	for key, value := range fields {
 		attrs = append(attrs, []byte(fmt.Sprintf(`%s="%s"; `, key, value))...)
 	}
 	attrs = attrs[:len(attrs)-2]
 	timeStr := r.Time.Format("[15:05:05.000]")
-	level := r.Level.String() + " " + MessageDelimeter
+	level := r.Level.String() + " " + MessageDelimiter
 	h.l.Println(timeStr, level, r.Message, string(attrs))
 	return nil
 }
@@ -59,7 +59,7 @@ func CtxWithAttr(ctx context.Context, attr slog.Attr) context.Context {
 		attrs = append(attrs, attr)
 		return context.WithValue(ctx, SlogFields, attrs)
 	}
-	attrs := []slog.Attr{}
+	var attrs []slog.Attr
 	attrs = append(attrs, attr)
 	return context.WithValue(ctx, SlogFields, attrs)
 }
