@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"math/rand"
 	"net"
 	"os"
 	"os/signal"
@@ -17,6 +16,7 @@ import (
 
 	"ttun/internal/logutils"
 	"ttun/internal/rpc"
+	"ttun/internal/types"
 )
 
 const NetworkBufferSize = 128
@@ -49,9 +49,9 @@ func (cmd *ClientCmd) Run() error {
 type ServerCmd struct{}
 
 func (cmd *ServerCmd) Run() error {
-	handshakeReqC := make(chan string)
-	handshakeResC := make(map[string]chan int)
-	closeProxyFd := make(map[string]chan struct{})
+	handshakeReqC := make(chan types.ConnID)
+	handshakeResC := make(map[types.ConnID]chan int)
+	closeProxyFd := make(map[types.ConnID]chan struct{})
 
 	cl := &Listener[*ClientHandler]{
 		port: 22000,
@@ -141,7 +141,7 @@ func (c *ProxyConnection) Connect() error {
 			return fmt.Errorf("failed to decode new rpc request from proxy: %w", err)
 		}
 		// todo: check that method is ping
-		slog.Debug("new rpc request from proxy", "request", req)
+		slog.Debug("new rpc request from proxy", "request", req.String())
 
 		conn := &IncomingConnection{connID: req.ConnID}
 		group.Go(conn.Init)
@@ -155,11 +155,11 @@ func (c *ProxyConnection) Connect() error {
 }
 
 type IncomingConnection struct {
-	connID string
+	connID types.ConnID
 }
 
 func (c *IncomingConnection) Init() error {
-	logger := slog.With("conn_id", c.connID)
+	logger := slog.With("conn_id", c.connID.String())
 	logger.Debug("proxy requested new connection")
 
 	proxyAddr, err := net.ResolveTCPAddr("tcp", "172.17.0.3:32345")
@@ -262,7 +262,7 @@ func (l *Listener[T]) Listen() error {
 }
 
 type ClientHandler struct {
-	handshakeReqC chan string
+	handshakeReqC chan types.ConnID
 }
 
 func (h *ClientHandler) ID() string { return "client-handler" }
@@ -278,7 +278,7 @@ func (h *ClientHandler) Handle(fd int, logger *slog.Logger) error {
 			logger.Debug("handshake request channel was closed")
 			break
 		}
-		logger = logger.With("conn_id", connID)
+		logger = logger.With("conn_id", connID.String())
 		logger.Debug("received new handshake")
 		req := rpc.Request{
 			Method: rpc.Ping,
@@ -294,8 +294,8 @@ func (h *ClientHandler) Handle(fd int, logger *slog.Logger) error {
 }
 
 type ProxyHandler struct {
-	handshakeResC map[string]chan int
-	closeProxyFd  map[string]chan struct{}
+	handshakeResC map[types.ConnID]chan int
+	closeProxyFd  map[types.ConnID]chan struct{}
 }
 
 func (h *ProxyHandler) ID() string { return "proxy-handler" }
@@ -331,16 +331,19 @@ func (h *ProxyHandler) Handle(fd int, _ *slog.Logger) error {
 }
 
 type IncomingHandler struct {
-	handshakeReqC chan string
-	handshakeResC map[string]chan int
-	closeProxyFd  map[string]chan struct{}
+	handshakeReqC chan types.ConnID
+	handshakeResC map[types.ConnID]chan int
+	closeProxyFd  map[types.ConnID]chan struct{}
 }
 
 func (h *IncomingHandler) ID() string { return "incoming-handler" }
 
 func (h *IncomingHandler) Handle(fd int, logger *slog.Logger) error {
-	connID := RandomString(12)
-	logger = logger.With("conn_id", connID)
+	connID, err := types.RandomConnID()
+	if err != nil {
+		return fmt.Errorf("failed to get random connection id: %w", err)
+	}
+	logger = logger.With("conn_id", connID.String())
 
 	resC := make(chan int)         // todo: where to close this channel?
 	h.handshakeResC[connID] = resC // todo: how to clear map
@@ -446,15 +449,6 @@ func InitHandler(
 		}
 		return nil
 	}
-}
-
-func RandomString(n int) string {
-	letterRunes := []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
-	b := make([]rune, n)
-	for i := range b {
-		b[i] = letterRunes[rand.Intn(len(letterRunes))]
-	}
-	return string(b)
 }
 
 func SockaddrToString(sa syscall.Sockaddr) string {

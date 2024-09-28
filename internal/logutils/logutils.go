@@ -15,7 +15,8 @@ const SlogFields CtxKey = "slog_fields"
 
 type SlogHandler struct {
 	slog.Handler
-	l *log.Logger
+	l     *log.Logger
+	attrs []slog.Attr
 }
 
 func NewSlogHandler(
@@ -33,6 +34,9 @@ func (h *SlogHandler) Handle(ctx context.Context, r slog.Record) error {
 		for _, v := range attrs {
 			r.AddAttrs(v)
 		}
+	}
+	for _, v := range h.attrs {
+		r.AddAttrs(v)
 	}
 	fields := make(map[string]interface{}, r.NumAttrs())
 	r.Attrs(func(a slog.Attr) bool {
@@ -57,6 +61,7 @@ func (h *SlogHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	return &SlogHandler{
 		Handler: h.Handler,
 		l:       h.l,
+		attrs:   attrs,
 	}
 }
 
