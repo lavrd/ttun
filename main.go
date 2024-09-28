@@ -48,10 +48,10 @@ func main() {
 
 	group := new(errgroup.Group)
 	switch os.Args[1] {
-	case "local":
+	case "client":
 		conn := &ProxyConnection{}
 		group.Go(conn.Connect)
-	case "public":
+	case "server":
 		handshakeReqC := make(chan string)
 		handshakeResC := make(map[string]chan int)
 		closeProxyFd := make(map[string]chan struct{})
