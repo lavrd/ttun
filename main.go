@@ -106,28 +106,32 @@ func (cmd *ServerCmd) Run() error {
 type ProxyConnection struct{}
 
 func (c *ProxyConnection) Connect() error {
-	addr, err := net.ResolveTCPAddr("tcp", "172.17.0.3:22000")
+	socket, err := Dial("172.17.0.3:22000")
 	if err != nil {
-		return fmt.Errorf("failed to resolve proxy address: %w", err)
-	}
-	conn, err := net.DialTCP("tcp", nil, addr)
-	if err != nil {
-		return fmt.Errorf("failed to connect to the proxy: %w", err)
+		return fmt.Errorf("failed to dial to proxy: %w", err)
 	}
 	defer func() {
-		if err = conn.Close(); err != nil {
-			slog.Error("failed to close socket with proxy", "error", err)
+		if err = syscall.Close(socket); err != nil {
+			slog.Error("failed to close proxy connection socket", "error", err)
 		}
 	}()
-	slog.Debug("connected to proxy")
+	slog.Info("successfully connected to proxy")
 
+	buf := make([]byte, NetworkBufSize)
 	group := new(errgroup.Group)
-	// todo: how to exit loop below
-	for {
-		buf := make([]byte, NetworkBufSize)
-		n, err := conn.Read(buf)
+	for !StopSignal.Load() {
+		var n int
+		n, err = syscall.Read(socket, buf)
 		if err != nil {
-			return fmt.Errorf("failed to read from proxy: %w", err)
+			if errors.Is(err, syscall.EAGAIN) {
+				time.Sleep(time.Millisecond * 5)
+				continue
+			}
+			return fmt.Errorf("failed to read from socket: %w", err)
+		}
+		if n == 0 {
+			slog.Info("connection with proxy is closed")
+			return nil
 		}
 		buf = buf[:n]
 
@@ -141,12 +145,13 @@ func (c *ProxyConnection) Connect() error {
 		conn := &IncomingConnection{connID: req.connID}
 		group.Go(conn.Init)
 	}
-	// todo: uncomment
-	// if err = group.Wait(); err != nil {
-	// 	return fmt.Errorf("failed to wait for all proxy connections: %w", err)
-	// }
+	slog.Debug("received stop signal, wait for proxy goroutines")
+	if err = group.Wait(); err != nil {
+		return fmt.Errorf("failed to wait for all proxy connections: %w", err)
+	}
+	slog.Debug("all goroutines are closed")
 
-	// return nil
+	return nil
 }
 
 type IncomingConnection struct {
@@ -157,17 +162,13 @@ func (c *IncomingConnection) Init() error {
 	logger := slog.With("conn_id", c.connID.String())
 	logger.Debug("proxy requested new connection")
 
-	proxyAddr, err := net.ResolveTCPAddr("tcp", "172.17.0.3:32345")
+	incomingSocket, err := Dial("172.17.0.3:32345")
 	if err != nil {
-		return fmt.Errorf("failed to resolve proxy address: %w", err)
-	}
-	proxyConn, err := net.DialTCP("tcp", nil, proxyAddr)
-	if err != nil {
-		return fmt.Errorf("failed to connect to the proxy: %w", err)
+		return fmt.Errorf("failed to dial incoming: %w", err)
 	}
 	defer func() {
-		if err = proxyConn.Close(); err != nil {
-			logger.Error("failed to close proxy connection", "error", err)
+		if err = syscall.Close(incomingSocket); err != nil {
+			logger.Error("failed to close incoming socket", "error", err)
 		}
 	}()
 
@@ -176,40 +177,25 @@ func (c *IncomingConnection) Init() error {
 		connID: c.connID,
 	}
 	buf := req.Encode()
-	if _, err = proxyConn.Write(buf); err != nil {
-		return fmt.Errorf("failed to write to proxy rpc request: %w", err)
+	if _, err = syscall.Write(incomingSocket, buf); err != nil {
+		return fmt.Errorf("failed to write to incoming rpc request: %w", err)
 	}
 
-	targetAddr, err := net.ResolveTCPAddr("tcp", "172.17.0.2:44000")
+	targetSocket, err := Dial("172.17.0.2:44000")
 	if err != nil {
-		return fmt.Errorf("failed to resolve target address: %w", err)
-	}
-	targetConn, err := net.DialTCP("tcp", nil, targetAddr)
-	if err != nil {
-		return fmt.Errorf("failed to connect to the target: %w", err)
+		return fmt.Errorf("failed to dial target: %w", err)
 	}
 	defer func() {
-		if err = targetConn.Close(); err != nil {
-			logger.Error("failed to close target connection", "error", err)
+		if err = syscall.Close(targetSocket); err != nil {
+			logger.Error("failed to close target socket", "error", err)
 		}
 	}()
 
-	proxyFile, err := proxyConn.File()
-	if err != nil {
-		return fmt.Errorf("failed to get proxy fd: %w", err)
-	}
-	proxyFd := proxyFile.Fd()
-
-	targetFile, err := targetConn.File()
-	if err != nil {
-		return fmt.Errorf("failed to get target fd: %w", err)
-	}
-	targetFd := targetFile.Fd()
-
 	logger.Debug("start copy streams")
-	if err = CopyStreams(proxyFd, targetFd); err != nil {
+	if err = CopyStreams(incomingSocket, targetSocket, logger); err != nil {
 		return fmt.Errorf("failed to copy streams: %w", err)
 	}
+	logger.Debug("copy streams is finished")
 
 	return nil
 }
@@ -252,7 +238,7 @@ func (l *Listener[T]) Listen() error {
 			}
 			return fmt.Errorf("failed to accept new connection: %w", err)
 		}
-		group.Go(InitHandler(fd, addr, l.handler, logger))
+		group.Go(InitListenerHandler(fd, addr, l.handler, logger))
 	}
 	if err = group.Wait(); err != nil {
 		return fmt.Errorf("failed to wait for connections: %w", err)
@@ -351,7 +337,7 @@ func (h *IncomingHandler) Handle(fd int, logger *slog.Logger) error {
 	// todo: do we need to close nfd here?
 	logger.Debug("received client fd", "nfd", nfd)
 
-	if err := CopyStreams(fd, nfd); err != nil {
+	if err := CopyStreams(fd, nfd, logger); err != nil {
 		h.closeProxyFd[connID] <- struct{}{}
 		return fmt.Errorf("failed to copy streams: %w", err)
 	}
@@ -383,10 +369,16 @@ func Listen(fd, port int) error {
 	return nil
 }
 
-func CopyData[T int | uintptr](srcFd, dstFd T, errC chan error) {
-	logger := slog.With("src_fd", srcFd, "dst_fd", dstFd)
+func CopyData[T int | uintptr](srcFd, dstFd T, errC chan error, logger *slog.Logger) {
+	logger = logger.With("src_fd", srcFd, "dst_fd", dstFd)
 	buf := make([]byte, NetworkBufSize)
 	for {
+		// Received stop os signal.
+		if StopSignal.Load() {
+			logger.Debug("stop signal received, stop copying data")
+			errC <- nil
+			return
+		}
 		n, err := syscall.Read(int(srcFd), buf)
 		if err != nil {
 			if errors.Is(err, syscall.EAGAIN) {
@@ -412,20 +404,21 @@ func SpawnCopyDataErr[T int | uintptr](message string, err error, srcFd, dstFd T
 	return fmt.Errorf("%s: src_fd=%d;dst_fd=%d: %w", message, srcFd, dstFd, err)
 }
 
-func CopyStreams[T int | uintptr](srcFd, dstFd T) error {
+func CopyStreams[T int | uintptr](srcFd, dstFd T, logger *slog.Logger) error {
 	errC := make(chan error)
-	go CopyData(srcFd, dstFd, errC)
-	go CopyData(dstFd, srcFd, errC)
+	go CopyData(srcFd, dstFd, errC, logger)
+	go CopyData(dstFd, srcFd, errC, logger)
 	var lastErr error
 	for i := 0; i < 2; i++ {
 		if err := <-errC; err != nil {
 			lastErr = err
 		}
 	}
+	logger.Debug("copy goroutines are stopped")
 	return lastErr
 }
 
-func InitHandler(
+func InitListenerHandler(
 	fd int, addr syscall.Sockaddr,
 	handler Handler,
 	logger *slog.Logger,
@@ -446,6 +439,37 @@ func InitHandler(
 		}
 		return nil
 	}
+}
+
+func Dial(address string) (int, error) {
+	addr, err := net.ResolveTCPAddr("tcp", address)
+	if err != nil {
+		return 0, fmt.Errorf("failed to resolve tcp address: %w", err)
+	}
+	socket, err := InitSocket()
+	if err != nil {
+		return 0, fmt.Errorf("failed to init socket: %w", err)
+	}
+	sockaddr := syscall.SockaddrInet4{Port: addr.Port}
+	copy(sockaddr.Addr[:], addr.IP.To4())
+	slog.Info("starting to connect to socket")
+	for {
+		err = syscall.Connect(socket, &sockaddr)
+		if errors.Is(err, syscall.EINPROGRESS) {
+			slog.Debug("connecting to socket is in progress", "error", err)
+			time.Sleep(time.Millisecond * 100)
+			continue
+		}
+		if errors.Is(err, syscall.EALREADY) {
+			slog.Debug("connection is already established", "error", err)
+			break
+		}
+		if err != nil {
+			return 0, fmt.Errorf("failed to connect to socket: %w", err)
+		}
+		break
+	}
+	return socket, nil
 }
 
 func SockaddrToString(sa syscall.Sockaddr) string {
