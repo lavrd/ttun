@@ -1,9 +1,13 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"io"
+	"log"
 	"log/slog"
+	"math/rand"
 	"net"
 	"os"
 	"os/signal"
@@ -13,13 +17,9 @@ import (
 
 	"github.com/alecthomas/kong"
 	"golang.org/x/sync/errgroup"
-
-	"ttun/internal/logutils"
-	"ttun/internal/rpc"
-	"ttun/internal/types"
 )
 
-const NetworkBufferSize = 128
+const NetworkBufSize = 128
 
 // It is okay to use global variable as it is atomic,
 // and we use it globally to stop all loops
@@ -28,9 +28,25 @@ const NetworkBufferSize = 128
 //nolint:gochecknoglobals // see comment above
 var StopSignal = &atomic.Bool{}
 
-type Handler interface {
-	ID() string
-	Handle(fd int, logger *slog.Logger) error
+func main() {
+	slogHandler := NewSlogHandler(
+		os.Stdout,
+		&slog.HandlerOptions{
+			Level:     slog.LevelDebug,
+			AddSource: true,
+		})
+	slog.SetDefault(slog.New(slogHandler))
+
+	kongCtx := kong.Parse(&CLI{})
+	if err := kongCtx.Run(); err != nil {
+		slog.Error("failed to run command", "error", err)
+		os.Exit(1)
+	}
+}
+
+type CLI struct {
+	Client ClientCmd `cmd:"" help:"Start client side."`
+	Server ServerCmd `cmd:"" help:"Start server side."`
 }
 
 type ClientCmd struct{}
@@ -49,9 +65,9 @@ func (cmd *ClientCmd) Run() error {
 type ServerCmd struct{}
 
 func (cmd *ServerCmd) Run() error {
-	handshakeReqC := make(chan types.ConnID)
-	handshakeResC := make(map[types.ConnID]chan int)
-	closeProxyFd := make(map[types.ConnID]chan struct{})
+	handshakeReqC := make(chan ConnID)
+	handshakeResC := make(map[ConnID]chan int)
+	closeProxyFd := make(map[ConnID]chan struct{})
 
 	cl := &Listener[*ClientHandler]{
 		port: 22000,
@@ -87,27 +103,6 @@ func (cmd *ServerCmd) Run() error {
 	return nil
 }
 
-type CLI struct {
-	Client ClientCmd `cmd:"" help:"Start client side."`
-	Server ServerCmd `cmd:"" help:"Start server side."`
-}
-
-func main() {
-	slogHandler := logutils.NewSlogHandler(
-		os.Stdout,
-		&slog.HandlerOptions{
-			Level:     slog.LevelDebug,
-			AddSource: true,
-		})
-	slog.SetDefault(slog.New(slogHandler))
-
-	kongCtx := kong.Parse(&CLI{})
-	if err := kongCtx.Run(); err != nil {
-		slog.Error("failed to run command", "error", err)
-		os.Exit(1)
-	}
-}
-
 type ProxyConnection struct{}
 
 func (c *ProxyConnection) Connect() error {
@@ -129,21 +124,21 @@ func (c *ProxyConnection) Connect() error {
 	group := new(errgroup.Group)
 	// todo: how to exit loop below
 	for {
-		buf := make([]byte, NetworkBufferSize)
+		buf := make([]byte, NetworkBufSize)
 		n, err := conn.Read(buf)
 		if err != nil {
 			return fmt.Errorf("failed to read from proxy: %w", err)
 		}
 		buf = buf[:n]
 
-		req := rpc.Request{}
+		req := RPCRequest{}
 		if err := req.Decode(buf); err != nil {
 			return fmt.Errorf("failed to decode new rpc request from proxy: %w", err)
 		}
 		// todo: check that method is ping
 		slog.Debug("new rpc request from proxy", "request", req.String())
 
-		conn := &IncomingConnection{connID: req.ConnID}
+		conn := &IncomingConnection{connID: req.connID}
 		group.Go(conn.Init)
 	}
 	// todo: uncomment
@@ -155,7 +150,7 @@ func (c *ProxyConnection) Connect() error {
 }
 
 type IncomingConnection struct {
-	connID types.ConnID
+	connID ConnID
 }
 
 func (c *IncomingConnection) Init() error {
@@ -176,9 +171,9 @@ func (c *IncomingConnection) Init() error {
 		}
 	}()
 
-	req := rpc.Request{
-		Method: rpc.Pong,
-		ConnID: c.connID,
+	req := RPCRequest{
+		method: Pong,
+		connID: c.connID,
 	}
 	buf := req.Encode()
 	if _, err = proxyConn.Write(buf); err != nil {
@@ -217,6 +212,11 @@ func (c *IncomingConnection) Init() error {
 	}
 
 	return nil
+}
+
+type Handler interface {
+	ID() string
+	Handle(fd int, logger *slog.Logger) error
 }
 
 type Listener[T Handler] struct {
@@ -262,7 +262,7 @@ func (l *Listener[T]) Listen() error {
 }
 
 type ClientHandler struct {
-	handshakeReqC chan types.ConnID
+	handshakeReqC chan ConnID
 }
 
 func (h *ClientHandler) ID() string { return "client-handler" }
@@ -280,9 +280,9 @@ func (h *ClientHandler) Handle(fd int, logger *slog.Logger) error {
 		}
 		logger = logger.With("conn_id", connID.String())
 		logger.Debug("received new handshake")
-		req := rpc.Request{
-			Method: rpc.Ping,
-			ConnID: connID,
+		req := RPCRequest{
+			method: Ping,
+			connID: connID,
 		}
 		buf := req.Encode()
 		if _, err := syscall.Write(fd, buf); err != nil {
@@ -294,31 +294,31 @@ func (h *ClientHandler) Handle(fd int, logger *slog.Logger) error {
 }
 
 type ProxyHandler struct {
-	handshakeResC map[types.ConnID]chan int
-	closeProxyFd  map[types.ConnID]chan struct{}
+	handshakeResC map[ConnID]chan int
+	closeProxyFd  map[ConnID]chan struct{}
 }
 
 func (h *ProxyHandler) ID() string { return "proxy-handler" }
 
 func (h *ProxyHandler) Handle(fd int, _ *slog.Logger) error {
-	buf := make([]byte, NetworkBufferSize)
+	buf := make([]byte, NetworkBufSize)
 	n, err := syscall.Read(fd, buf)
 	if err != nil {
 		return fmt.Errorf("failed to read from fd: %w", err)
 	}
-	req := rpc.Request{}
+	req := RPCRequest{}
 	if err = req.Decode(buf[:n]); err != nil {
 		return fmt.Errorf("failed to decode request: %w", err)
 	}
 	// todo: check that it is pong message
 
-	handshakeResC, ok := h.handshakeResC[req.ConnID]
+	handshakeResC, ok := h.handshakeResC[req.connID]
 	if !ok {
 		// todo: very bad
 	}
 
 	closeC := make(chan struct{})
-	h.closeProxyFd[req.ConnID] = closeC
+	h.closeProxyFd[req.connID] = closeC
 	// todo: who should close and delete this channel from map?
 	handshakeResC <- fd
 	// todo: who should close and delete this channel from map?
@@ -331,18 +331,15 @@ func (h *ProxyHandler) Handle(fd int, _ *slog.Logger) error {
 }
 
 type IncomingHandler struct {
-	handshakeReqC chan types.ConnID
-	handshakeResC map[types.ConnID]chan int
-	closeProxyFd  map[types.ConnID]chan struct{}
+	handshakeReqC chan ConnID
+	handshakeResC map[ConnID]chan int
+	closeProxyFd  map[ConnID]chan struct{}
 }
 
 func (h *IncomingHandler) ID() string { return "incoming-handler" }
 
 func (h *IncomingHandler) Handle(fd int, logger *slog.Logger) error {
-	connID, err := types.RandomConnID()
-	if err != nil {
-		return fmt.Errorf("failed to get random connection id: %w", err)
-	}
+	connID := RandomConnID()
 	logger = logger.With("conn_id", connID.String())
 
 	resC := make(chan int)         // todo: where to close this channel?
@@ -388,7 +385,7 @@ func Listen(fd, port int) error {
 
 func CopyData[T int | uintptr](srcFd, dstFd T, errC chan error) {
 	logger := slog.With("src_fd", srcFd, "dst_fd", dstFd)
-	buf := make([]byte, NetworkBufferSize)
+	buf := make([]byte, NetworkBufSize)
 	for {
 		n, err := syscall.Read(int(srcFd), buf)
 		if err != nil {
@@ -467,4 +464,144 @@ func WaitSignal() {
 	signalName := (<-interrupt).String()
 	slog.Debug("received os signal", "signal", signalName)
 	StopSignal.Store(true)
+}
+
+const ConnIDSize = 12
+
+type ConnID [ConnIDSize]byte
+
+func (c ConnID) String() string {
+	return string(c[:])
+}
+
+func RandomConnID() ConnID {
+	letterRunes := []byte("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+	var buf ConnID
+	for i := 0; i < ConnIDSize; i++ {
+		buf[i] = letterRunes[rand.Intn(len(letterRunes))]
+	}
+	return buf
+}
+
+const RPCMethodSize = 1
+
+type RPCMethod uint8
+
+const (
+	Ping RPCMethod = iota + 1
+	Pong
+)
+
+const RPCRequestSize = RPCMethodSize + ConnIDSize
+
+var ErrSerialization = errors.New("serialization error")
+
+type RPCRequest struct {
+	method RPCMethod
+	connID ConnID
+}
+
+func (r *RPCRequest) Encode() []byte {
+	buf := make([]byte, RPCRequestSize)
+	buf[0] = byte(r.method)
+	copy(buf[RPCMethodSize:], r.connID[:])
+	return buf
+}
+
+func (r *RPCRequest) Decode(buf []byte) error {
+	if buf == nil {
+		return fmt.Errorf("buf is nil: %w", ErrSerialization)
+	}
+	if len(buf) != RPCRequestSize {
+		return fmt.Errorf("bad request size: %w", ErrSerialization)
+	}
+	r.method = RPCMethod(buf[0])
+	if r.method == 0 {
+		return fmt.Errorf("rpc method is zero: %w", ErrSerialization)
+	}
+	copy(r.connID[:], buf[RPCMethodSize:RPCRequestSize])
+	return nil
+}
+
+func (r *RPCRequest) String() string {
+	method := ""
+	switch r.method {
+	case Ping:
+		method = "ping"
+	case Pong:
+		method = "pong"
+	default:
+		method = "unknown"
+	}
+	return fmt.Sprintf("method:%s,conn_id:%s", method, r.connID.String())
+}
+
+type CtxKey string
+
+const CtxKeySlogFields CtxKey = "slog_fields"
+
+func CtxWithAttr(ctx context.Context, attr slog.Attr) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if attrs, ok := ctx.Value(CtxKeySlogFields).([]slog.Attr); ok {
+		attrs = append(attrs, attr)
+		return context.WithValue(ctx, CtxKeySlogFields, attrs)
+	}
+	var attrs []slog.Attr
+	attrs = append(attrs, attr)
+	return context.WithValue(ctx, CtxKeySlogFields, attrs)
+}
+
+type SlogHandler struct {
+	slog.Handler
+	l     *log.Logger
+	attrs []slog.Attr
+}
+
+func NewSlogHandler(
+	out io.Writer,
+	opts *slog.HandlerOptions,
+) *SlogHandler {
+
+	return &SlogHandler{
+		Handler: slog.NewTextHandler(out, opts),
+		l:       log.New(out, "", 0),
+	}
+}
+
+func (h *SlogHandler) Handle(ctx context.Context, r slog.Record) error {
+	if attrs, ok := ctx.Value(CtxKeySlogFields).([]slog.Attr); ok {
+		for _, v := range attrs {
+			r.AddAttrs(v)
+		}
+	}
+	for _, v := range h.attrs {
+		r.AddAttrs(v)
+	}
+	fields := make(map[string]interface{}, r.NumAttrs())
+	r.Attrs(func(a slog.Attr) bool {
+		fields[a.Key] = a.Value.Any()
+		return true
+	})
+	attrs := []byte(" ")
+	for key, value := range fields {
+		attrs = append(attrs, []byte(fmt.Sprintf(`%s="%v" `, key, value))...)
+	}
+	// If there are no attributes this byte array is empty.
+	if len(attrs) != 1 {
+		attrs = attrs[:len(attrs)-1] // remove last space
+	}
+	timeStr := r.Time.Format(time.RFC3339)
+	level := r.Level.String() + " "
+	h.l.Println(timeStr, level, r.Message, string(attrs))
+	return nil
+}
+
+func (h *SlogHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return &SlogHandler{
+		Handler: h.Handler,
+		l:       h.l,
+		attrs:   attrs,
+	}
 }

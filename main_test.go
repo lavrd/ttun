@@ -1,4 +1,4 @@
-package rpc
+package main
 
 import (
 	"testing"
@@ -9,18 +9,18 @@ import (
 func TestSuccess(t *testing.T) {
 	r := require.New(t)
 	testCases := []struct {
-		req Request
+		req RPCRequest
 		buf []byte
 	}{
-		{Request{Method: Ping, ConnID: [12]byte{44}}, []byte{1, 44, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
-		{Request{Method: Pong, ConnID: [12]byte{55}}, []byte{2, 55, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+		{RPCRequest{method: Ping, connID: [12]byte{44}}, []byte{1, 44, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+		{RPCRequest{method: Pong, connID: [12]byte{55}}, []byte{2, 55, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
 	}
 	for i := range testCases {
 		tc := testCases[i]
 		t.Run("", func(t *testing.T) {
 			buf := tc.req.Encode()
 			r.Equal(tc.buf, buf)
-			req := Request{}
+			req := RPCRequest{}
 			err := req.Decode(buf)
 			r.NoError(err)
 			r.Equal(tc.req, req)
@@ -30,7 +30,7 @@ func TestSuccess(t *testing.T) {
 
 func TestBufIsNil(t *testing.T) {
 	r := require.New(t)
-	req := Request{}
+	req := RPCRequest{}
 	err := req.Decode(nil)
 	r.Error(err)
 	r.ErrorIs(err, ErrSerialization)
@@ -39,7 +39,7 @@ func TestBufIsNil(t *testing.T) {
 
 func TestIncorrectBufLength(t *testing.T) {
 	r := require.New(t)
-	req := Request{}
+	req := RPCRequest{}
 	err := req.Decode([]byte{0})
 	r.Error(err)
 	r.ErrorIs(err, ErrSerialization)
@@ -48,7 +48,7 @@ func TestIncorrectBufLength(t *testing.T) {
 
 func TestMethodIsZero(t *testing.T) {
 	r := require.New(t)
-	req := Request{}
+	req := RPCRequest{}
 	err := req.Decode([]byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0})
 	r.Error(err)
 	r.ErrorIs(err, ErrSerialization)
