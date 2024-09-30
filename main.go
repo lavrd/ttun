@@ -20,7 +20,7 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-const NetworkBufSize = 128
+const NetworkBufSize = 256
 
 // It is okay to use global variable as it is atomic,
 // and we use it globally to stop all loops
@@ -450,15 +450,18 @@ func Listen(fd, port int) error {
 
 func CopyData[T int | uintptr](srcFd, dstFd T, errC chan error, logger *slog.Logger) {
 	logger = logger.With("src_fd", srcFd, "dst_fd", dstFd)
+
+	defer func() {
+		if err := syscall.Shutdown(int(dstFd), syscall.SHUT_WR); err != nil {
+			logger.Error("failed to shut down destination socket", "error", err)
+		}
+	}()
+
 	buf := make([]byte, NetworkBufSize)
 	for {
 		// Received stop os signal.
 		if StopSignal.Load() {
 			logger.Debug("stop signal received, stop copying data")
-			if err := syscall.Shutdown(int(dstFd), syscall.SHUT_WR); err != nil {
-				errC <- fmt.Errorf("failed to shut down destination socket: %w", err)
-				return
-			}
 			errC <- nil
 			return
 		}
@@ -468,19 +471,11 @@ func CopyData[T int | uintptr](srcFd, dstFd T, errC chan error, logger *slog.Log
 				time.Sleep(time.Millisecond * 5)
 				continue
 			}
-			if err = syscall.Shutdown(int(dstFd), syscall.SHUT_WR); err != nil {
-				errC <- fmt.Errorf("failed to shut down destination socket: %w", err)
-				return
-			}
 			errC <- SpawnCopyDataErr("failed to read from source socket", err, srcFd, dstFd)
 			return
 		}
 		if n == 0 {
 			logger.Debug("connection with source socket is closed")
-			if err = syscall.Shutdown(int(dstFd), syscall.SHUT_WR); err != nil {
-				errC <- fmt.Errorf("failed to shut down destination socket: %w", err)
-				return
-			}
 			errC <- nil
 			return
 		}
