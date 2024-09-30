@@ -19,7 +19,7 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-const NetworkBufSize = 8192
+const NetworkBufSize = 256
 
 func main() {
 	slogHandler := NewSlogHandler(
@@ -442,12 +442,12 @@ func CopyData[T int | uintptr](ctx context.Context, srcFd, dstFd T, errC chan er
 	ctx = CtxWithAttr(ctx, slog.Int("src_fd", int(srcFd)))
 	ctx = CtxWithAttr(ctx, slog.Int("dst_fd", int(dstFd)))
 
-	defer func() {
+	shutdown := func() {
 		slog.DebugContext(ctx, "shut down destination socket")
 		if err := syscall.Shutdown(int(dstFd), syscall.SHUT_WR); err != nil {
 			slog.ErrorContext(ctx, "failed to shut down destination socket", "error", err)
 		}
-	}()
+	}
 
 	buf := make([]byte, NetworkBufSize)
 	for {
@@ -455,6 +455,7 @@ func CopyData[T int | uintptr](ctx context.Context, srcFd, dstFd T, errC chan er
 		select {
 		case <-ctx.Done():
 			slog.DebugContext(ctx, "stop signal received on reading, stop copying data")
+			shutdown()
 			errC <- nil
 			return
 		default:
@@ -471,6 +472,7 @@ func CopyData[T int | uintptr](ctx context.Context, srcFd, dstFd T, errC chan er
 		}
 		if n == 0 {
 			slog.DebugContext(ctx, "connection with source socket is closed")
+			shutdown()
 			errC <- nil
 			return
 		}
@@ -479,6 +481,7 @@ func CopyData[T int | uintptr](ctx context.Context, srcFd, dstFd T, errC chan er
 			select {
 			case <-ctx.Done():
 				slog.DebugContext(ctx, "stop signal received on writing, stop copying data")
+				shutdown()
 				errC <- nil
 				return
 			default:
