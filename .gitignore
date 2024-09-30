@@ -2,3 +2,5 @@
 .vscode
 
 target
+
+curl-test-data

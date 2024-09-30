@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"log/slog"
+	"math"
 	"math/rand"
 	"net"
 	"os"
@@ -52,13 +53,32 @@ type CLI struct {
 type ClientCmd struct{}
 
 func (cmd *ClientCmd) Run() error {
-	conn := &ProxyConnection{}
-	group := new(errgroup.Group)
-	group.Go(conn.Connect)
-	WaitSignal()
-	if err := group.Wait(); err != nil {
-		return fmt.Errorf("failed to wait for goroutines: %w", err)
+	errC := make(chan error)
+	defer close(errC)
+	interrupt := make(chan os.Signal, 1)
+	defer close(interrupt)
+	signal.Notify(interrupt, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
+
+	go func() {
+		conn := &ProxyConnection{}
+		errC <- conn.Connect()
+	}()
+
+	select {
+	case <-interrupt:
+		signalName := (<-interrupt).String()
+		slog.Debug("received os signal", "signal", signalName)
+		StopSignal.Store(true)
+		if err := <-errC; err != nil {
+			return fmt.Errorf("failed to wait for proxy connection: %w", err)
+		}
+	case err := <-errC:
+		StopSignal.Store(true)
+		if err != nil {
+			return fmt.Errorf("failed to establish proxy connection: %w", err)
+		}
 	}
+
 	return nil
 }
 
@@ -74,6 +94,8 @@ func (cmd *ServerCmd) Run() error {
 		handler: &ClientHandler{
 			handshakeReqC: handshakeReqC,
 		},
+		// We want to have only one active client at one moment.
+		maxConns: 1,
 	}
 	pl := &Listener[*ProxyHandler]{
 		port: 32345,
@@ -81,6 +103,7 @@ func (cmd *ServerCmd) Run() error {
 			handshakeResC: handshakeResC,
 			closeProxyFd:  closeProxyFd,
 		},
+		maxConns: math.MaxInt,
 	}
 	il := &Listener[*IncomingHandler]{
 		port: 14600,
@@ -89,13 +112,20 @@ func (cmd *ServerCmd) Run() error {
 			handshakeResC: handshakeResC,
 			closeProxyFd:  closeProxyFd,
 		},
+		maxConns: math.MaxInt,
 	}
 
 	group := new(errgroup.Group)
 	group.Go(cl.Listen)
 	group.Go(pl.Listen)
 	group.Go(il.Listen)
-	WaitSignal()
+
+	interrupt := make(chan os.Signal, 1)
+	signal.Notify(interrupt, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
+	signalName := (<-interrupt).String()
+	slog.Debug("received os signal", "signal", signalName)
+
+	StopSignal.Store(true)
 	if err := group.Wait(); err != nil {
 		return fmt.Errorf("failed to wait for goroutines: %w", err)
 	}
@@ -136,10 +166,13 @@ func (c *ProxyConnection) Connect() error {
 		buf = buf[:n]
 
 		req := RPCRequest{}
-		if err := req.Decode(buf); err != nil {
+		if err = req.Decode(buf); err != nil {
 			return fmt.Errorf("failed to decode new rpc request from proxy: %w", err)
 		}
-		// todo: check that method is ping
+		if req.method != Ping {
+			slog.Debug("rpc request method from proxy is not ping, skip it", "method", req.method)
+			continue
+		}
 		slog.Debug("new rpc request from proxy", "request", req.String())
 
 		conn := &IncomingConnection{connID: req.connID}
@@ -203,17 +236,19 @@ func (c *IncomingConnection) Init() error {
 type Handler interface {
 	ID() string
 	Handle(fd int, logger *slog.Logger) error
+	Close()
 }
 
 type Listener[T Handler] struct {
-	port    int
-	handler T
+	port     int
+	handler  T
+	maxConns int
 }
 
 func (l *Listener[T]) Listen() error {
 	logger := slog.With("id", l.handler.ID())
 
-	socket, err := InitSocket()
+	socket, err := InitSocket(true)
 	if err != nil {
 		return fmt.Errorf("failed to init socket: %w", err)
 	}
@@ -223,6 +258,7 @@ func (l *Listener[T]) Listen() error {
 	logger.Debug("listen for connections to socket", "port", l.port)
 
 	group := new(errgroup.Group)
+	group.SetLimit(l.maxConns)
 	for {
 		if StopSignal.Load() {
 			logger.Debug("break listen array because of stop signal")
@@ -238,11 +274,19 @@ func (l *Listener[T]) Listen() error {
 			}
 			return fmt.Errorf("failed to accept new connection: %w", err)
 		}
-		group.Go(InitListenerHandler(fd, addr, l.handler, logger))
+		if err = syscall.SetNonblock(fd, true); err != nil {
+			return fmt.Errorf("failed to set socket nonblock: %w", err)
+		}
+		ok := group.TryGo(InitListenerHandler(fd, addr, l.handler, logger))
+		if !ok {
+			logger.Warn("cannot init new connection because of goroutines limit")
+			continue
+		}
 	}
 	if err = group.Wait(); err != nil {
 		return fmt.Errorf("failed to wait for connections: %w", err)
 	}
+	l.handler.Close()
 
 	return nil
 }
@@ -253,16 +297,12 @@ type ClientHandler struct {
 
 func (h *ClientHandler) ID() string { return "client-handler" }
 
-// todo: make sure we have only one active connection there
 func (h *ClientHandler) Handle(fd int, logger *slog.Logger) error {
 	for {
-		// todo: where to close handshake channel?
 		connID, ok := <-h.handshakeReqC
 		if !ok {
-			// todo: how to close all proxy connections?
-			// todo: do we need to close all proxy connections?
 			logger.Debug("handshake request channel was closed")
-			break
+			return nil
 		}
 		logger = logger.With("conn_id", connID.String())
 		logger.Debug("received new handshake")
@@ -276,8 +316,9 @@ func (h *ClientHandler) Handle(fd int, logger *slog.Logger) error {
 		}
 		logger.Debug("rpc request to client was sent")
 	}
-	return nil
 }
+
+func (h *ClientHandler) Close() {}
 
 type ProxyHandler struct {
 	handshakeResC map[ConnID]chan int
@@ -286,34 +327,50 @@ type ProxyHandler struct {
 
 func (h *ProxyHandler) ID() string { return "proxy-handler" }
 
-func (h *ProxyHandler) Handle(fd int, _ *slog.Logger) error {
+func (h *ProxyHandler) Handle(fd int, logger *slog.Logger) error {
 	buf := make([]byte, NetworkBufSize)
-	n, err := syscall.Read(fd, buf)
-	if err != nil {
-		return fmt.Errorf("failed to read from fd: %w", err)
+	for {
+		n, err := syscall.Read(fd, buf)
+		if errors.Is(err, syscall.EAGAIN) {
+			time.Sleep(time.Millisecond * 5)
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("failed to read from fd: %w", err)
+		}
+		buf = buf[:n]
+		break
 	}
 	req := RPCRequest{}
-	if err = req.Decode(buf[:n]); err != nil {
+	if err := req.Decode(buf); err != nil {
 		return fmt.Errorf("failed to decode request: %w", err)
 	}
-	// todo: check that it is pong message
-
-	handshakeResC, ok := h.handshakeResC[req.connID]
-	if !ok {
-		// todo: very bad
+	if req.method != Pong {
+		logger.Debug("rpc request message is not pong", "method", req.method)
+		return nil
 	}
 
-	closeC := make(chan struct{})
-	h.closeProxyFd[req.connID] = closeC
-	// todo: who should close and delete this channel from map?
-	handshakeResC <- fd
-	// todo: who should close and delete this channel from map?
-	// todo: check that it is not closed
-	<-closeC
+	handshakeResC := h.handshakeResC[req.connID]
+	defer func() {
+		close(handshakeResC)
+		delete(h.handshakeResC, req.connID)
+	}()
 
-	// todo: make log
+	closeProxyFd := make(chan struct{})
+	h.closeProxyFd[req.connID] = closeProxyFd
+
+	handshakeResC <- fd
+
+	<-closeProxyFd
 
 	return nil
+}
+
+func (h *ProxyHandler) Close() {
+	// Only this handler writes to this channel so it should close it.
+	for _, ch := range h.handshakeResC {
+		close(ch)
+	}
 }
 
 type IncomingHandler struct {
@@ -328,30 +385,52 @@ func (h *IncomingHandler) Handle(fd int, logger *slog.Logger) error {
 	connID := RandomConnID()
 	logger = logger.With("conn_id", connID.String())
 
-	resC := make(chan int)         // todo: where to close this channel?
-	h.handshakeResC[connID] = resC // todo: how to clear map
+	// We need to set up and save this channel,
+	// before send handshake request to client handler,
+	// otherwise there will be panic in client handler,
+	// because it will not find a proper channel with exact connection id.
+	handshakeResC := make(chan int)
+	h.handshakeResC[connID] = handshakeResC
 
+	// Send request to establish new proxy connection.
 	h.handshakeReqC <- connID
 	logger.Debug("handshake request was sent")
-	nfd := <-resC // todo: rename
-	// todo: do we need to close nfd here?
-	logger.Debug("received client fd", "nfd", nfd)
 
-	if err := CopyStreams(fd, nfd, logger); err != nil {
-		h.closeProxyFd[connID] <- struct{}{}
+	proxyFd := <-handshakeResC
+	logger.Debug("received proxy fd", "proxy_fd", proxyFd)
+
+	closeProxyFd := h.closeProxyFd[connID]
+	defer func() {
+		closeProxyFd <- struct{}{}
+		close(closeProxyFd)
+		delete(h.closeProxyFd, connID)
+	}()
+
+	if err := CopyStreams(fd, proxyFd, logger); err != nil {
+		closeProxyFd <- struct{}{}
 		return fmt.Errorf("failed to copy streams: %w", err)
 	}
-	h.closeProxyFd[connID] <- struct{}{}
+	closeProxyFd <- struct{}{}
 
 	return nil
 }
 
-func InitSocket() (int, error) {
+func (h *IncomingHandler) Close() {
+	// This function is called when all incoming connections are closed.
+	// So we need to close this channel because no one will write to it.
+	close(h.handshakeReqC)
+	// Only this handler writes to this channel so it should close it.
+	for _, ch := range h.closeProxyFd {
+		close(ch)
+	}
+}
+
+func InitSocket(nonblock bool) (int, error) {
 	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, syscall.IPPROTO_TCP)
 	if err != nil {
 		return 0, fmt.Errorf("failed init socket: %w", err)
 	}
-	if err = syscall.SetNonblock(fd, true); err != nil {
+	if err = syscall.SetNonblock(fd, nonblock); err != nil {
 		return 0, fmt.Errorf("failed to set nonblock: %w", err)
 	}
 	return fd, nil
@@ -376,6 +455,10 @@ func CopyData[T int | uintptr](srcFd, dstFd T, errC chan error, logger *slog.Log
 		// Received stop os signal.
 		if StopSignal.Load() {
 			logger.Debug("stop signal received, stop copying data")
+			if err := syscall.Shutdown(int(dstFd), syscall.SHUT_WR); err != nil {
+				errC <- fmt.Errorf("failed to shut down destination socket: %w", err)
+				return
+			}
 			errC <- nil
 			return
 		}
@@ -385,17 +468,33 @@ func CopyData[T int | uintptr](srcFd, dstFd T, errC chan error, logger *slog.Log
 				time.Sleep(time.Millisecond * 5)
 				continue
 			}
+			if err = syscall.Shutdown(int(dstFd), syscall.SHUT_WR); err != nil {
+				errC <- fmt.Errorf("failed to shut down destination socket: %w", err)
+				return
+			}
 			errC <- SpawnCopyDataErr("failed to read from source socket", err, srcFd, dstFd)
 			return
 		}
 		if n == 0 {
 			logger.Debug("connection with source socket is closed")
+			if err = syscall.Shutdown(int(dstFd), syscall.SHUT_WR); err != nil {
+				errC <- fmt.Errorf("failed to shut down destination socket: %w", err)
+				return
+			}
 			errC <- nil
 			return
 		}
-		if _, err = syscall.Write(int(dstFd), buf[:n]); err != nil {
-			errC <- SpawnCopyDataErr("failed to write to destination socket", err, srcFd, dstFd)
-			return
+		for !StopSignal.Load() {
+			_, err = syscall.Write(int(dstFd), buf[:n])
+			if errors.Is(err, syscall.EAGAIN) {
+				time.Sleep(time.Millisecond * 5)
+				continue
+			}
+			if err != nil {
+				errC <- SpawnCopyDataErr("failed to write to destination socket", err, srcFd, dstFd)
+				return
+			}
+			break
 		}
 	}
 }
@@ -406,11 +505,13 @@ func SpawnCopyDataErr[T int | uintptr](message string, err error, srcFd, dstFd T
 
 func CopyStreams[T int | uintptr](srcFd, dstFd T, logger *slog.Logger) error {
 	errC := make(chan error)
+	defer close(errC)
 	go CopyData(srcFd, dstFd, errC, logger)
 	go CopyData(dstFd, srcFd, errC, logger)
 	var lastErr error
 	for i := 0; i < 2; i++ {
 		if err := <-errC; err != nil {
+			logger.Error("received error from copy data goroutine", "error", err)
 			lastErr = err
 		}
 	}
@@ -446,7 +547,7 @@ func Dial(address string) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("failed to resolve tcp address: %w", err)
 	}
-	socket, err := InitSocket()
+	socket, err := InitSocket(false)
 	if err != nil {
 		return 0, fmt.Errorf("failed to init socket: %w", err)
 	}
@@ -480,14 +581,6 @@ func SockaddrToString(sa syscall.Sockaddr) string {
 	default:
 		return "unknown address"
 	}
-}
-
-func WaitSignal() {
-	interrupt := make(chan os.Signal, 1)
-	signal.Notify(interrupt, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
-	signalName := (<-interrupt).String()
-	slog.Debug("received os signal", "signal", signalName)
-	StopSignal.Store(true)
 }
 
 const ConnIDSize = 12
@@ -564,18 +657,18 @@ type CtxKey string
 
 const CtxKeySlogFields CtxKey = "slog_fields"
 
-func CtxWithAttr(ctx context.Context, attr slog.Attr) context.Context {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if attrs, ok := ctx.Value(CtxKeySlogFields).([]slog.Attr); ok {
-		attrs = append(attrs, attr)
-		return context.WithValue(ctx, CtxKeySlogFields, attrs)
-	}
-	var attrs []slog.Attr
-	attrs = append(attrs, attr)
-	return context.WithValue(ctx, CtxKeySlogFields, attrs)
-}
+// func CtxWithAttr(ctx context.Context, attr slog.Attr) context.Context {
+// 	if ctx == nil {
+// 		ctx = context.Background()
+// 	}
+// 	if attrs, ok := ctx.Value(CtxKeySlogFields).([]slog.Attr); ok {
+// 		attrs = append(attrs, attr)
+// 		return context.WithValue(ctx, CtxKeySlogFields, attrs)
+// 	}
+// 	var attrs []slog.Attr
+// 	attrs = append(attrs, attr)
+// 	return context.WithValue(ctx, CtxKeySlogFields, attrs)
+// }
 
 type SlogHandler struct {
 	slog.Handler
@@ -591,6 +684,7 @@ func NewSlogHandler(
 	return &SlogHandler{
 		Handler: slog.NewTextHandler(out, opts),
 		l:       log.New(out, "", 0),
+		attrs:   make([]slog.Attr, 0),
 	}
 }
 
@@ -617,15 +711,25 @@ func (h *SlogHandler) Handle(ctx context.Context, r slog.Record) error {
 		attrs = attrs[:len(attrs)-1] // remove last space
 	}
 	timeStr := r.Time.Format(time.RFC3339)
-	level := r.Level.String() + " "
+	var level string
+	switch r.Level {
+	case slog.LevelDebug, slog.LevelError:
+		level = r.Level.String()
+	default:
+		// To make all levels aligned (text).
+		level = r.Level.String() + " "
+	}
+	level += " "
 	h.l.Println(timeStr, level, r.Message, string(attrs))
 	return nil
 }
 
 func (h *SlogHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	slogAttrs := h.attrs
+	slogAttrs = append(slogAttrs, attrs...)
 	return &SlogHandler{
 		Handler: h.Handler,
 		l:       h.l,
-		attrs:   attrs,
+		attrs:   slogAttrs,
 	}
 }
