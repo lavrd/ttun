@@ -61,9 +61,8 @@ func (cmd *ClientCmd) Run() error {
 	}()
 
 	select {
-	case <-interrupt:
-		signalName := (<-interrupt).String()
-		slog.Debug("received os signal", "signal", signalName)
+	case sig := <-interrupt:
+		slog.Debug("received os signal", "signal", sig.String())
 		cancel()
 		if err := <-errC; err != nil {
 			return fmt.Errorf("failed to wait for proxy connection: %w", err)
