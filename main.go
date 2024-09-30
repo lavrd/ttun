@@ -136,7 +136,7 @@ func (cmd *ServerCmd) Run() error {
 type ProxyConnection struct{}
 
 func (c *ProxyConnection) Connect() error {
-	socket, err := Dial("172.17.0.3:22000")
+	socket, err := Dial("172.17.0.3:22000", true)
 	if err != nil {
 		return fmt.Errorf("failed to dial to proxy: %w", err)
 	}
@@ -195,7 +195,7 @@ func (c *IncomingConnection) Init() error {
 	logger := slog.With("conn_id", c.connID.String())
 	logger.Debug("proxy requested new connection")
 
-	incomingSocket, err := Dial("172.17.0.3:32345")
+	incomingSocket, err := Dial("172.17.0.3:32345", false)
 	if err != nil {
 		return fmt.Errorf("failed to dial incoming: %w", err)
 	}
@@ -214,7 +214,7 @@ func (c *IncomingConnection) Init() error {
 		return fmt.Errorf("failed to write to incoming rpc request: %w", err)
 	}
 
-	targetSocket, err := Dial("172.17.0.2:44000")
+	targetSocket, err := Dial("172.17.0.2:44000", false)
 	if err != nil {
 		return fmt.Errorf("failed to dial target: %w", err)
 	}
@@ -542,12 +542,12 @@ func InitListenerHandler(
 	}
 }
 
-func Dial(address string) (int, error) {
+func Dial(address string, nonblocking bool) (int, error) {
 	addr, err := net.ResolveTCPAddr("tcp", address)
 	if err != nil {
 		return 0, fmt.Errorf("failed to resolve tcp address: %w", err)
 	}
-	socket, err := InitSocket(false)
+	socket, err := InitSocket(nonblocking)
 	if err != nil {
 		return 0, fmt.Errorf("failed to init socket: %w", err)
 	}
