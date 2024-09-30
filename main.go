@@ -407,10 +407,8 @@ func (h *IncomingHandler) Handle(fd int, logger *slog.Logger) error {
 	}()
 
 	if err := CopyStreams(fd, proxyFd, logger); err != nil {
-		closeProxyFd <- struct{}{}
 		return fmt.Errorf("failed to copy streams: %w", err)
 	}
-	closeProxyFd <- struct{}{}
 
 	return nil
 }
