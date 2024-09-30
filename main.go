@@ -19,7 +19,7 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-const NetworkBufSize = 256
+const NetworkBufSize = 8192
 
 func main() {
 	slogHandler := NewSlogHandler(
@@ -55,10 +55,7 @@ func (cmd *ClientCmd) Run() error {
 	defer close(interrupt)
 	signal.Notify(interrupt, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
 
-	go func() {
-		conn := &ProxyConnection{}
-		errC <- conn.Connect(ctx)
-	}()
+	go func() { errC <- InitProxyConnection(ctx) }()
 
 	select {
 	case sig := <-interrupt:
@@ -87,7 +84,6 @@ func (cmd *ServerCmd) Run() error {
 	closeProxyFd := make(map[ConnID]chan struct{})
 
 	cl := &Listener[*ClientHandler]{
-		ctx:  ctx,
 		port: 22000,
 		handler: &ClientHandler{
 			handshakeReqC: handshakeReqC,
@@ -96,7 +92,6 @@ func (cmd *ServerCmd) Run() error {
 		maxConns: 1,
 	}
 	pl := &Listener[*ProxyHandler]{
-		ctx:  ctx,
 		port: 32345,
 		handler: &ProxyHandler{
 			handshakeResC: handshakeResC,
@@ -105,7 +100,6 @@ func (cmd *ServerCmd) Run() error {
 		maxConns: math.MaxInt,
 	}
 	il := &Listener[*IncomingHandler]{
-		ctx:  ctx,
 		port: 14600,
 		handler: &IncomingHandler{
 			handshakeReqC: handshakeReqC,
@@ -116,9 +110,9 @@ func (cmd *ServerCmd) Run() error {
 	}
 
 	group := new(errgroup.Group)
-	group.Go(cl.Listen)
-	group.Go(pl.Listen)
-	group.Go(il.Listen)
+	group.Go(func() error { return cl.Listen(ctx) })
+	group.Go(func() error { return pl.Listen(ctx) })
+	group.Go(func() error { return il.Listen(ctx) })
 
 	interrupt := make(chan os.Signal, 1)
 	signal.Notify(interrupt, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
@@ -133,10 +127,8 @@ func (cmd *ServerCmd) Run() error {
 	return nil
 }
 
-type ProxyConnection struct{}
-
-func (c *ProxyConnection) Connect(ctx context.Context) error {
-	socket, err := Dial("172.17.0.3:22000", true)
+func InitProxyConnection(ctx context.Context) error {
+	socket, err := Dial(ctx, "172.17.0.3:22000", true)
 	if err != nil {
 		return fmt.Errorf("failed to dial to proxy: %w", err)
 	}
@@ -186,54 +178,48 @@ func (c *ProxyConnection) Connect(ctx context.Context) error {
 		}
 		slog.Debug("new rpc request from proxy", "request", req.String())
 
-		conn := &IncomingConnection{ctx: ctx, connID: req.connID}
-		group.Go(conn.Init)
+		group.Go(func() error { return InitIncomingConnection(ctx, req.connID) })
 	}
 }
 
-type IncomingConnection struct {
-	ctx    context.Context
-	connID ConnID
-}
+func InitIncomingConnection(ctx context.Context, connID ConnID) error {
+	ctx = CtxWithAttr(ctx, slog.String("conn_id", connID.String()))
+	slog.DebugContext(ctx, "proxy requested new connection")
 
-func (c *IncomingConnection) Init() error {
-	logger := slog.With("conn_id", c.connID.String())
-	logger.Debug("proxy requested new connection")
-
-	incomingSocket, err := Dial("172.17.0.3:32345", false)
+	incomingSocket, err := Dial(ctx, "172.17.0.3:32345", false)
 	if err != nil {
 		return fmt.Errorf("failed to dial incoming: %w", err)
 	}
 	defer func() {
 		if err = syscall.Close(incomingSocket); err != nil {
-			logger.Error("failed to close incoming socket", "error", err)
+			slog.ErrorContext(ctx, "failed to close incoming socket", "error", err)
 		}
 	}()
 
 	req := RPCRequest{
 		method: Pong,
-		connID: c.connID,
+		connID: connID,
 	}
 	buf := req.Encode()
 	if _, err = syscall.Write(incomingSocket, buf); err != nil {
 		return fmt.Errorf("failed to write to incoming rpc request: %w", err)
 	}
 
-	targetSocket, err := Dial("172.17.0.2:44000", false)
+	targetSocket, err := Dial(ctx, "172.17.0.2:44000", false)
 	if err != nil {
 		return fmt.Errorf("failed to dial target: %w", err)
 	}
 	defer func() {
 		if err = syscall.Close(targetSocket); err != nil {
-			logger.Error("failed to close target socket", "error", err)
+			slog.ErrorContext(ctx, "failed to close target socket", "error", err)
 		}
 	}()
 
-	logger.Debug("start copy streams")
-	if err = CopyStreams(c.ctx, incomingSocket, targetSocket); err != nil {
+	slog.DebugContext(ctx, "start copy streams")
+	if err = CopyStreams(ctx, incomingSocket, targetSocket); err != nil {
 		return fmt.Errorf("failed to copy streams: %w", err)
 	}
-	logger.Debug("copy streams is finished")
+	slog.DebugContext(ctx, "copy streams is finished")
 
 	return nil
 }
@@ -245,14 +231,13 @@ type Handler interface {
 }
 
 type Listener[T Handler] struct {
-	ctx      context.Context
 	port     int
 	handler  T
 	maxConns int
 }
 
-func (l *Listener[T]) Listen() error {
-	logger := slog.With("id", l.handler.ID())
+func (l *Listener[T]) Listen(ctx context.Context) error {
+	ctx = CtxWithAttr(ctx, slog.String("id", l.handler.ID()))
 
 	socket, err := InitSocket(true)
 	if err != nil {
@@ -261,16 +246,16 @@ func (l *Listener[T]) Listen() error {
 	if err = Listen(socket, l.port); err != nil {
 		return fmt.Errorf("failed to listen socket: %w", err)
 	}
-	logger.Debug("listen for connections to socket", "port", l.port)
+	slog.DebugContext(ctx, "listen for connections to socket", "port", l.port)
 
 	group := new(errgroup.Group)
 	group.SetLimit(l.maxConns)
 	for {
 		select {
-		case <-l.ctx.Done():
-			logger.Debug("break listen array because of stop signal")
+		case <-ctx.Done():
+			slog.DebugContext(ctx, "break listen array because of stop signal")
 			if err = group.Wait(); err != nil {
-				logger.Error("failed to wait for goroutines", "error", err)
+				slog.ErrorContext(ctx, "failed to wait for goroutines", "error", err)
 			}
 			l.handler.Close()
 			return nil
@@ -290,9 +275,9 @@ func (l *Listener[T]) Listen() error {
 		if err = syscall.SetNonblock(fd, true); err != nil {
 			return fmt.Errorf("failed to set socket nonblock: %w", err)
 		}
-		ok := group.TryGo(InitListenerHandler(l.ctx, fd, addr, l.handler))
+		ok := group.TryGo(InitListenerHandler(ctx, fd, addr, l.handler))
 		if !ok {
-			logger.Warn("cannot init new connection because of goroutines limit")
+			slog.WarnContext(ctx, "cannot init new connection because of goroutines limit")
 			continue
 		}
 	}
@@ -458,6 +443,7 @@ func CopyData[T int | uintptr](ctx context.Context, srcFd, dstFd T, errC chan er
 	ctx = CtxWithAttr(ctx, slog.Int("dst_fd", int(dstFd)))
 
 	defer func() {
+		slog.DebugContext(ctx, "shut down destination socket")
 		if err := syscall.Shutdown(int(dstFd), syscall.SHUT_WR); err != nil {
 			slog.ErrorContext(ctx, "failed to shut down destination socket", "error", err)
 		}
@@ -521,12 +507,14 @@ func CopyStreams[T int | uintptr](ctx context.Context, srcFd, dstFd T) error {
 	defer close(errC)
 	go CopyData(ctx, srcFd, dstFd, errC)
 	go CopyData(ctx, dstFd, srcFd, errC)
+	slog.DebugContext(ctx, "copy goroutines are started")
 	var lastErr error
 	for i := 0; i < 2; i++ {
 		if err := <-errC; err != nil {
 			slog.ErrorContext(ctx, "received error from copy data goroutine", "error", err)
 			lastErr = err
 		}
+		slog.DebugContext(ctx, "one goroutine is stopped")
 	}
 	slog.DebugContext(ctx, "copy goroutines are stopped")
 	return lastErr
@@ -551,7 +539,8 @@ func InitListenerHandler(
 	}
 }
 
-func Dial(address string, nonblocking bool) (int, error) {
+func Dial(ctx context.Context, address string, nonblocking bool) (int, error) {
+	ctx = CtxWithAttr(ctx, slog.String("address", address))
 	addr, err := net.ResolveTCPAddr("tcp", address)
 	if err != nil {
 		return 0, fmt.Errorf("failed to resolve tcp address: %w", err)
@@ -562,16 +551,16 @@ func Dial(address string, nonblocking bool) (int, error) {
 	}
 	sockaddr := syscall.SockaddrInet4{Port: addr.Port}
 	copy(sockaddr.Addr[:], addr.IP.To4())
-	slog.Info("starting to connect to socket")
+	slog.InfoContext(ctx, "starting to connect to socket")
 	for {
 		err = syscall.Connect(socket, &sockaddr)
 		if errors.Is(err, syscall.EINPROGRESS) {
-			slog.Debug("connecting to socket is in progress", "error", err)
+			slog.DebugContext(ctx, "connecting to socket is in progress", "error", err)
 			time.Sleep(time.Millisecond * 100)
 			continue
 		}
 		if errors.Is(err, syscall.EALREADY) {
-			slog.Debug("connection is already established", "error", err)
+			slog.DebugContext(ctx, "connection is already established", "error", err)
 			return socket, nil
 		}
 		if err != nil {
@@ -667,6 +656,7 @@ const CtxKeySlogFields CtxKey = "slog_fields"
 
 func CtxWithAttr(ctx context.Context, attr slog.Attr) context.Context {
 	if ctx == nil {
+		slog.WarnContext(ctx, "context is nil when try to add attributes")
 		ctx = context.Background()
 	}
 	if attrs, ok := ctx.Value(CtxKeySlogFields).([]slog.Attr); ok {
