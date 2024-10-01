@@ -35,7 +35,11 @@ func genMockData() error {
 	if err != nil {
 		return fmt.Errorf("failed to open file to save mock data: %w", err)
 	}
-	defer file.Close()
+	defer func() {
+		if err = file.Close(); err != nil {
+			slog.Error("failed to close mock data file", "error", err)
+		}
+	}()
 
 	// 50MB.
 	const fileSize = 1024 * 1024 * 50
@@ -77,6 +81,6 @@ func (l *LoggerMiddleware) Handler(h http.Handler) http.Handler {
 	})
 }
 
-func healthHandler(w http.ResponseWriter, r *http.Request) {
+func healthHandler(w http.ResponseWriter, _ *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }

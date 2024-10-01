@@ -19,7 +19,7 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-const NetworkBufSize = 256
+const NetworkBufSize = 8192
 
 func main() {
 	slogHandler := NewSlogHandler(
@@ -186,7 +186,7 @@ func InitIncomingConnection(ctx context.Context, connID ConnID) error {
 	ctx = CtxWithAttr(ctx, slog.String("conn_id", connID.String()))
 	slog.DebugContext(ctx, "proxy requested new connection")
 
-	incomingSocket, err := Dial(ctx, "172.17.0.3:32345", false)
+	incomingSocket, err := Dial(ctx, "172.17.0.3:32345", true)
 	if err != nil {
 		return fmt.Errorf("failed to dial incoming: %w", err)
 	}
@@ -195,6 +195,7 @@ func InitIncomingConnection(ctx context.Context, connID ConnID) error {
 			slog.ErrorContext(ctx, "failed to close incoming socket", "error", err)
 		}
 	}()
+	slog.DebugContext(ctx, "incoming socket is established", "fd", incomingSocket)
 
 	req := RPCRequest{
 		method: Pong,
@@ -205,7 +206,7 @@ func InitIncomingConnection(ctx context.Context, connID ConnID) error {
 		return fmt.Errorf("failed to write to incoming rpc request: %w", err)
 	}
 
-	targetSocket, err := Dial(ctx, "172.17.0.2:44000", false)
+	targetSocket, err := Dial(ctx, "172.17.0.2:44000", true)
 	if err != nil {
 		return fmt.Errorf("failed to dial target: %w", err)
 	}
@@ -214,6 +215,7 @@ func InitIncomingConnection(ctx context.Context, connID ConnID) error {
 			slog.ErrorContext(ctx, "failed to close target socket", "error", err)
 		}
 	}()
+	slog.DebugContext(ctx, "target socket is established", "fd", targetSocket)
 
 	slog.DebugContext(ctx, "start copy streams")
 	if err = CopyStreams(ctx, incomingSocket, targetSocket); err != nil {
@@ -243,7 +245,7 @@ func (l *Listener[T]) Listen(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to init socket: %w", err)
 	}
-	if err = Listen(socket, l.port); err != nil {
+	if err = ListenSocket(socket, l.port); err != nil {
 		return fmt.Errorf("failed to listen socket: %w", err)
 	}
 	slog.DebugContext(ctx, "listen for connections to socket", "port", l.port)
@@ -420,13 +422,15 @@ func InitSocket(nonblock bool) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("failed init socket: %w", err)
 	}
-	if err = syscall.SetNonblock(fd, nonblock); err != nil {
-		return 0, fmt.Errorf("failed to set nonblock: %w", err)
+	if nonblock {
+		if err = syscall.SetNonblock(fd, true); err != nil {
+			return 0, fmt.Errorf("failed to set nonblock: %w", err)
+		}
 	}
 	return fd, nil
 }
 
-func Listen(fd, port int) error {
+func ListenSocket(fd, port int) error {
 	addr := syscall.SockaddrInet4{Port: port}
 	copy(addr.Addr[:], []byte{0, 0, 0, 0})
 	if err := syscall.Bind(fd, &addr); err != nil {
@@ -438,16 +442,19 @@ func Listen(fd, port int) error {
 	return nil
 }
 
+func ShutdownSocket[T int | uintptr](ctx context.Context, fd T) {
+	ctx = CtxWithAttr(ctx, slog.Int("fd", int(fd)))
+	slog.DebugContext(ctx, "shut down socket")
+	if err := syscall.Shutdown(int(fd), syscall.SHUT_WR); err != nil {
+		slog.ErrorContext(ctx, "failed to shut down socket", "error", err)
+	}
+}
+
 func CopyData[T int | uintptr](ctx context.Context, srcFd, dstFd T, errC chan error) {
 	ctx = CtxWithAttr(ctx, slog.Int("src_fd", int(srcFd)))
 	ctx = CtxWithAttr(ctx, slog.Int("dst_fd", int(dstFd)))
 
-	shutdown := func() {
-		slog.DebugContext(ctx, "shut down destination socket")
-		if err := syscall.Shutdown(int(dstFd), syscall.SHUT_WR); err != nil {
-			slog.ErrorContext(ctx, "failed to shut down destination socket", "error", err)
-		}
-	}
+	defer ShutdownSocket(ctx, dstFd)
 
 	buf := make([]byte, NetworkBufSize)
 	for {
@@ -455,7 +462,6 @@ func CopyData[T int | uintptr](ctx context.Context, srcFd, dstFd T, errC chan er
 		select {
 		case <-ctx.Done():
 			slog.DebugContext(ctx, "stop signal received on reading, stop copying data")
-			shutdown()
 			errC <- nil
 			return
 		default:
@@ -472,7 +478,6 @@ func CopyData[T int | uintptr](ctx context.Context, srcFd, dstFd T, errC chan er
 		}
 		if n == 0 {
 			slog.DebugContext(ctx, "connection with source socket is closed")
-			shutdown()
 			errC <- nil
 			return
 		}
@@ -481,7 +486,6 @@ func CopyData[T int | uintptr](ctx context.Context, srcFd, dstFd T, errC chan er
 			select {
 			case <-ctx.Done():
 				slog.DebugContext(ctx, "stop signal received on writing, stop copying data")
-				shutdown()
 				errC <- nil
 				return
 			default:
@@ -698,15 +702,11 @@ func (h *SlogHandler) Handle(ctx context.Context, r slog.Record) error {
 	for _, v := range h.attrs {
 		r.AddAttrs(v)
 	}
-	fields := make(map[string]interface{}, r.NumAttrs())
+	attrs := []byte(" ")
 	r.Attrs(func(a slog.Attr) bool {
-		fields[a.Key] = a.Value.Any()
+		attrs = append(attrs, []byte(fmt.Sprintf(`%s="%v" `, a.Key, a.Value.String()))...)
 		return true
 	})
-	attrs := []byte(" ")
-	for key, value := range fields {
-		attrs = append(attrs, []byte(fmt.Sprintf(`%s="%v" `, key, value))...)
-	}
 	// If there are no attributes this byte array is empty.
 	if len(attrs) != 1 {
 		attrs = attrs[:len(attrs)-1] // remove last space
