@@ -19,7 +19,7 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-const NetworkBufSize = 128
+const NetworkBufSize = 256
 
 func main() {
 	slogHandler := NewSlogHandler(
@@ -110,9 +110,9 @@ func (cmd *ServerCmd) Run() error {
 	}
 
 	group := new(errgroup.Group)
-	group.Go(func() error { return cl.Listen(ctx) })
-	group.Go(func() error { return pl.Listen(ctx) })
-	group.Go(func() error { return il.Listen(ctx) })
+	group.Go(func() error { return cl.Listen(ctx, true) })
+	group.Go(func() error { return pl.Listen(ctx, false) })
+	group.Go(func() error { return il.Listen(ctx, false) })
 
 	interrupt := make(chan os.Signal, 1)
 	signal.Notify(interrupt, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
@@ -137,18 +137,18 @@ func InitProxyConnection(ctx context.Context) error {
 			slog.Error("failed to close proxy connection socket", "error", err)
 		}
 	}()
-	slog.Info("successfully connected to proxy")
+	slog.InfoContext(ctx, "successfully connected to proxy")
 
 	buf := make([]byte, NetworkBufSize)
 	group := new(errgroup.Group)
 	for {
 		select {
 		case <-ctx.Done():
-			slog.Debug("received stop signal, wait for proxy goroutines")
+			slog.DebugContext(ctx, "received stop signal, wait for proxy goroutines")
 			if err = group.Wait(); err != nil {
 				return fmt.Errorf("failed to wait for all proxy connections: %w", err)
 			}
-			slog.Debug("all goroutines are closed")
+			slog.DebugContext(ctx, "all goroutines are closed")
 			return nil
 		default:
 		}
@@ -163,7 +163,7 @@ func InitProxyConnection(ctx context.Context) error {
 			return fmt.Errorf("failed to read from socket: %w", err)
 		}
 		if n == 0 {
-			slog.Info("connection with proxy is closed")
+			slog.InfoContext(ctx, "connection with proxy is closed")
 			return nil
 		}
 		buf = buf[:n]
@@ -172,13 +172,19 @@ func InitProxyConnection(ctx context.Context) error {
 		if err = req.Decode(buf); err != nil {
 			return fmt.Errorf("failed to decode new rpc request from proxy: %w", err)
 		}
-		if req.method != Ping {
-			slog.Debug("rpc request method from proxy is not ping, skip it", "method", req.method)
-			continue
+		switch req.method {
+		case Ping:
+			req = RPCRequest{method: Pong}
+			buf = req.Encode()
+			if _, err = syscall.Write(socket, buf); err != nil {
+				return fmt.Errorf("failed to write pong response: %w", err)
+			}
+		case Connect:
+			slog.DebugContext(ctx, "init incoming connection", "conn_id", req.connID)
+			group.Go(func() error { return InitIncomingConnection(ctx, req.connID) })
+		default:
+			slog.DebugContext(ctx, "rpc request method from proxy is not connect, skip it", "method", req.method)
 		}
-		slog.Debug("new rpc request from proxy", "request", req.String())
-
-		group.Go(func() error { return InitIncomingConnection(ctx, req.connID) })
 	}
 }
 
@@ -198,7 +204,7 @@ func InitIncomingConnection(ctx context.Context, connID ConnID) error {
 	slog.DebugContext(ctx, "incoming socket is established", "fd", incomingSocket)
 
 	req := RPCRequest{
-		method: Pong,
+		method: Ack,
 		connID: connID,
 	}
 	buf := req.Encode()
@@ -238,7 +244,7 @@ type Listener[T Handler] struct {
 	maxConns int
 }
 
-func (l *Listener[T]) Listen(ctx context.Context) error {
+func (l *Listener[T]) Listen(ctx context.Context, nonblock bool) error {
 	ctx = CtxWithAttr(ctx, slog.String("id", l.handler.ID()))
 
 	socket, err := InitSocket(true)
@@ -274,6 +280,11 @@ func (l *Listener[T]) Listen(ctx context.Context) error {
 			}
 			return fmt.Errorf("failed to accept new connection: %w", err)
 		}
+		if nonblock {
+			if err = syscall.SetNonblock(fd, true); err != nil {
+				return fmt.Errorf("failed to set fd as nonblock: %w", err)
+			}
+		}
 		ok := group.TryGo(InitListenerHandler(ctx, fd, addr, l.handler))
 		if !ok {
 			slog.WarnContext(ctx, "cannot init new connection because of goroutines limit")
@@ -289,23 +300,58 @@ type ClientHandler struct {
 func (h *ClientHandler) ID() string { return "client-handler" }
 
 func (h *ClientHandler) Handle(ctx context.Context, fd int) error {
+	t := time.NewTimer(time.Second)
+	defer t.Stop()
 	for {
-		connID, ok := <-h.handshakeReqC
-		if !ok {
-			slog.DebugContext(ctx, "handshake request channel was closed")
-			return nil
+		select {
+		case <-t.C:
+			req := RPCRequest{method: Ping}
+			buf := req.Encode()
+			if _, err := syscall.Write(fd, buf); err != nil {
+				return fmt.Errorf("faield to ping client: %w", err)
+			}
+			buf = make([]byte, NetworkBufSize)
+			for {
+				n, err := syscall.Read(fd, buf)
+				if errors.Is(err, syscall.EAGAIN) {
+					time.Sleep(time.Millisecond * 5)
+					continue
+				}
+				if err != nil {
+					return fmt.Errorf("failed to read from socket: %w", err)
+				}
+				if n == 0 {
+					slog.DebugContext(ctx, "client was disconnected")
+					return nil
+				}
+				req = RPCRequest{}
+				if err = req.Decode(buf[:n]); err != nil {
+					return fmt.Errorf("failed to decode rpc request: %w", err)
+				}
+				if req.method != Pong {
+					slog.ErrorContext(ctx, "response method should be pong after ping request", "method", req.method)
+					return nil
+				}
+				break
+			}
+			t.Reset(time.Second)
+		case connID, ok := <-h.handshakeReqC:
+			if !ok {
+				slog.DebugContext(ctx, "handshake request channel was closed")
+				return nil
+			}
+			ctx = CtxWithAttr(ctx, slog.String("conn_id", connID.String()))
+			slog.DebugContext(ctx, "received new handshake")
+			req := RPCRequest{
+				method: Connect,
+				connID: connID,
+			}
+			buf := req.Encode()
+			if _, err := syscall.Write(fd, buf); err != nil {
+				return fmt.Errorf("failed to write ping message to fd: %w", err)
+			}
+			slog.DebugContext(ctx, "rpc request to client was sent")
 		}
-		ctx = CtxWithAttr(ctx, slog.String("conn_id", connID.String()))
-		slog.DebugContext(ctx, "received new handshake")
-		req := RPCRequest{
-			method: Ping,
-			connID: connID,
-		}
-		buf := req.Encode()
-		if _, err := syscall.Write(fd, buf); err != nil {
-			return fmt.Errorf("failed to write ping message to fd: %w", err)
-		}
-		slog.DebugContext(ctx, "rpc request to client was sent")
 	}
 }
 
@@ -336,8 +382,8 @@ func (h *ProxyHandler) Handle(ctx context.Context, fd int) error {
 	if err := req.Decode(buf); err != nil {
 		return fmt.Errorf("failed to decode request: %w", err)
 	}
-	if req.method != Pong {
-		slog.DebugContext(ctx, "rpc request message is not pong", "method", req.method)
+	if req.method != Ack {
+		slog.DebugContext(ctx, "rpc request message is not ack", "method", req.method)
 		return nil
 	}
 
@@ -608,6 +654,8 @@ type RPCMethod uint8
 const (
 	Ping RPCMethod = iota + 1
 	Pong
+	Connect
+	Ack
 )
 
 const RPCRequestSize = RPCMethodSize + ConnIDSize
@@ -648,10 +696,18 @@ func (r *RPCRequest) String() string {
 		method = "ping"
 	case Pong:
 		method = "pong"
+	case Connect:
+		method = "connect"
+	case Ack:
+		method = "ack"
 	default:
 		method = "unknown"
 	}
-	return fmt.Sprintf("method:%s,conn_id:%s", method, r.connID.String())
+	connID := r.connID.String()
+	if connID == "" {
+		return fmt.Sprintf("method:%s", method)
+	}
+	return fmt.Sprintf("method:%s,conn_id:%s", method, connID)
 }
 
 type CtxKey string
