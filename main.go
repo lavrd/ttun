@@ -19,7 +19,7 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-const NetworkBufSize = 8192
+const NetworkBufSize = 128
 
 func main() {
 	slogHandler := NewSlogHandler(
@@ -186,7 +186,7 @@ func InitIncomingConnection(ctx context.Context, connID ConnID) error {
 	ctx = CtxWithAttr(ctx, slog.String("conn_id", connID.String()))
 	slog.DebugContext(ctx, "proxy requested new connection")
 
-	incomingSocket, err := Dial(ctx, "172.17.0.3:32345", true)
+	incomingSocket, err := Dial(ctx, "172.17.0.3:32345", false)
 	if err != nil {
 		return fmt.Errorf("failed to dial incoming: %w", err)
 	}
@@ -206,7 +206,7 @@ func InitIncomingConnection(ctx context.Context, connID ConnID) error {
 		return fmt.Errorf("failed to write to incoming rpc request: %w", err)
 	}
 
-	targetSocket, err := Dial(ctx, "172.17.0.2:44000", true)
+	targetSocket, err := Dial(ctx, "172.17.0.2:44000", false)
 	if err != nil {
 		return fmt.Errorf("failed to dial target: %w", err)
 	}
@@ -273,9 +273,6 @@ func (l *Listener[T]) Listen(ctx context.Context) error {
 				continue
 			}
 			return fmt.Errorf("failed to accept new connection: %w", err)
-		}
-		if err = syscall.SetNonblock(fd, true); err != nil {
-			return fmt.Errorf("failed to set socket nonblock: %w", err)
 		}
 		ok := group.TryGo(InitListenerHandler(ctx, fd, addr, l.handler))
 		if !ok {
