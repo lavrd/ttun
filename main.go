@@ -66,7 +66,7 @@ func (cmd *CmdClient) Run() error {
 
 	select {
 	case sig := <-interrupt:
-		slog.Debug("received os signal", "signal", sig.String())
+		slog.DebugContext(ctx, "received os signal", "signal", sig.String())
 		cancel()
 		if err := <-errC; err != nil {
 			return fmt.Errorf("failed to wait for proxy connection: %w", err)
@@ -124,7 +124,7 @@ func (cmd *CmdServer) Run() error {
 	interrupt := make(chan os.Signal, 1)
 	signal.Notify(interrupt, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
 	signalName := (<-interrupt).String()
-	slog.Debug("received os signal", "signal", signalName)
+	slog.DebugContext(ctx, "received os signal", "signal", signalName)
 	cancel()
 
 	if err := group.Wait(); err != nil {
@@ -141,7 +141,7 @@ func InitProxyConnection(ctx context.Context) error {
 	}
 	defer func() {
 		if err = syscall.Close(socket); err != nil {
-			slog.Error("failed to close proxy connection socket", "error", err)
+			slog.ErrorContext(ctx, "failed to close proxy connection socket", "error", err)
 		}
 	}()
 	slog.InfoContext(ctx, "successfully connected to proxy")
