@@ -6,47 +6,29 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+
+	"github.com/alecthomas/kong"
 )
 
-func main() {
-	logger := slog.Default()
-	if len(os.Args) != 2 {
-		logger.Error("invalid number of arguments to proceed", "number", len(os.Args), "required", 2)
-		return
-	}
-	switch os.Args[1] {
-	case "gen":
-		if err := genMockData(); err != nil {
-			logger.Error("failed to generate mock data", "error", err)
-			return
-		}
-	case "run":
-		if err := runServer(); err != nil {
-			logger.Error("failed to run mock server", "error", err)
-			return
-		}
-	default:
-		logger.Error("unknown command for custom mock server", "command", os.Args[1])
-	}
+type Cmd struct {
+	Gen    CmdGen    `cmd:"" help:"Generate mock data."`
+	Server CmdServer `cmd:"" help:"Start mock data server."`
 }
 
-func genMockData() error {
+type CmdGen struct {
+	Size int `default:"50" help:"Mock data size in megabytes."`
+}
+
+func (cmd *CmdGen) Run() error {
 	file, err := os.OpenFile("../data/bytes.txt", os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	if err != nil {
 		return fmt.Errorf("failed to open file to save mock data: %w", err)
 	}
-	defer func() {
-		if err = file.Close(); err != nil {
-			slog.Error("failed to close mock data file", "error", err)
-		}
-	}()
+	defer file.Close()
 
-	// 50MB.
-	const fileSize = 1024 * 1024 * 50
-	// 1MB.
-	const bufferSize = 1024 * 1024
+	const bufferSize = 1024 * 1024 // 1MB
 	buffer := make([]byte, bufferSize)
-	for i := int64(0); i < fileSize; i += bufferSize {
+	for i := 0; i < cmd.Size; i++ {
 		if _, err = rand.Read(buffer); err != nil {
 			return fmt.Errorf("failed to fill buffer with random data: %w", err)
 		}
@@ -58,7 +40,9 @@ func genMockData() error {
 	return nil
 }
 
-func runServer() error {
+type CmdServer struct{}
+
+func (cmd *CmdServer) Run() error {
 	logger := slog.Default()
 	loggerMiddleware := &LoggerMiddleware{logger: logger}
 	http.Handle("/health", loggerMiddleware.Handler(http.HandlerFunc(healthHandler)))
@@ -68,6 +52,14 @@ func runServer() error {
 		return fmt.Errorf("failed to listen and serve: %w", err)
 	}
 	return nil
+}
+
+func main() {
+	kctx := kong.Parse(&Cmd{})
+	if err := kctx.Run(); err != nil {
+		slog.Error("failed to run command", "error", err)
+		os.Exit(1)
+	}
 }
 
 type LoggerMiddleware struct {

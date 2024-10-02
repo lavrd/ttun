@@ -7,6 +7,7 @@ linters-settings:
   errcheck:
     check-type-assertions: true
     check-blank: true
+    disable-default-exclusions: true
   gocritic:
     enabled-tags:
       - diagnostic
@@ -43,8 +44,7 @@ linters-settings:
     checks: ["all", "-ST1003"]
   unused:
     field-writes-are-uses: false
-    # https://github.com/golangci/golangci-lint/issues/4218
-    #exported-is-used: false
+    post-statements-are-reads: true
     exported-fields-are-used: false
     # Enable it manually to check for unused variables.
     # We can't enable it permanentrly, because a lot of

@@ -38,13 +38,13 @@ func main() {
 }
 
 type Cmd struct {
-	Client ClientCmd `cmd:"" help:"Start client side."`
-	Server ServerCmd `cmd:"" help:"Start server side."`
+	Client CmdClient `cmd:"" help:"Start client side."`
+	Server CmdServer `cmd:"" help:"Start server side."`
 }
 
-type ClientCmd struct{}
+type CmdClient struct{}
 
-func (cmd *ClientCmd) Run() error {
+func (cmd *CmdClient) Run() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -73,9 +73,9 @@ func (cmd *ClientCmd) Run() error {
 	return nil
 }
 
-type ServerCmd struct{}
+type CmdServer struct{}
 
-func (cmd *ServerCmd) Run() error {
+func (cmd *CmdServer) Run() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
