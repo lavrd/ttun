@@ -12,10 +12,12 @@ func TestSuccess(t *testing.T) {
 		req RPCRequest
 		buf []byte
 	}{
-		{RPCRequest{method: Ping, connID: [12]byte{}}, []byte{1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
-		{RPCRequest{method: Pong, connID: [12]byte{}}, []byte{2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
-		{RPCRequest{method: Connect, connID: [12]byte{44}}, []byte{3, 44, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
-		{RPCRequest{method: Ack, connID: [12]byte{55}}, []byte{4, 55, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+		{RPCRequest{method: Hello, connID: [12]byte{}}, []byte{1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+		{RPCRequest{method: Busy, connID: [12]byte{}}, []byte{2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+		{RPCRequest{method: Ping, connID: [12]byte{}}, []byte{3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+		{RPCRequest{method: Pong, connID: [12]byte{}}, []byte{4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+		{RPCRequest{method: Connect, connID: [12]byte{44}}, []byte{5, 44, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+		{RPCRequest{method: Ack, connID: [12]byte{55}}, []byte{6, 55, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
 	}
 	for i := range testCases {
 		tc := testCases[i]

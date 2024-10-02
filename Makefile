@@ -20,7 +20,6 @@ test:
 
 run_docker_client:
 	docker run --rm -it \
-		--name ttun-client \
   	ttun client
 
 run_docker_server:

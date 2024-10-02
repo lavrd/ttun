@@ -189,6 +189,7 @@ func InitProxyConnection(ctx context.Context, proxyAddress, incomingAddress, tar
 	slog.InfoContext(ctx, "successfully connected to proxy")
 
 	buf := make([]byte, NetworkBufSize)
+	helloT := time.NewTimer(time.Second)
 	group := new(errgroup.Group)
 	for {
 		select {
@@ -198,6 +199,9 @@ func InitProxyConnection(ctx context.Context, proxyAddress, incomingAddress, tar
 				return fmt.Errorf("failed to wait for all proxy connections: %w", err)
 			}
 			slog.DebugContext(ctx, "all goroutines are closed")
+			return nil
+		case <-helloT.C:
+			slog.InfoContext(ctx, "hello message from the server is not received")
 			return nil
 		default:
 		}
@@ -221,6 +225,11 @@ func InitProxyConnection(ctx context.Context, proxyAddress, incomingAddress, tar
 			return fmt.Errorf("failed to decode new rpc request from proxy: %w", err)
 		}
 		switch req.method {
+		case Hello:
+			helloT.Stop()
+		case Busy:
+			slog.InfoContext(ctx, "server is busy with another client")
+			return nil
 		case Ping:
 			req = RPCRequest{method: Pong}
 			buf = req.Encode()
@@ -288,6 +297,7 @@ func InitIncomingConnection(ctx context.Context, connID ConnID, incomingAddress,
 type Handler interface {
 	ID() string
 	Handle(ctx context.Context, fd int) error
+	Hello(ctx context.Context, fd int) error
 	Close()
 }
 
@@ -341,12 +351,21 @@ func (l *Listener[T]) Listen(ctx context.Context, nonblock bool) error {
 
 		ok := group.TryGo(InitListenerHandler(ctx, fd, addr, l.handler))
 		if !ok {
-			slog.WarnContext(ctx, "cannot init new connection because of goroutines limit")
-			if err = syscall.Close(fd); err != nil {
-				slog.ErrorContext(ctx, "failed to close fd", "error", err)
-			}
+			ReplyBusy(ctx, fd)
 			continue
 		}
+	}
+}
+
+func ReplyBusy(ctx context.Context, fd int) {
+	slog.WarnContext(ctx, "cannot init new connection because of goroutines limit")
+	rpc := RPCRequest{method: Busy}
+	buf := rpc.Encode()
+	if _, err := syscall.Write(fd, buf); err != nil {
+		slog.ErrorContext(ctx, "failed to write busy message to fd", "error", err)
+	}
+	if err := syscall.Close(fd); err != nil {
+		slog.ErrorContext(ctx, "failed to close fd", "error", err)
 	}
 }
 
@@ -365,6 +384,9 @@ func InitListenerHandler(
 			}
 			slog.DebugContext(ctx, "fd closed")
 		}()
+		if err := handler.Hello(ctx, fd); err != nil {
+			return fmt.Errorf("failed to say hello: %w", err)
+		}
 		return handler.Handle(ctx, fd)
 	}
 }
@@ -384,7 +406,7 @@ func (h *ClientHandler) Handle(ctx context.Context, fd int) error {
 			req := RPCRequest{method: Ping}
 			buf := req.Encode()
 			if _, err := syscall.Write(fd, buf); err != nil {
-				return fmt.Errorf("faield to ping client: %w", err)
+				return fmt.Errorf("failed to ping client: %w", err)
 			}
 			buf = make([]byte, NetworkBufSize)
 			for {
@@ -424,11 +446,21 @@ func (h *ClientHandler) Handle(ctx context.Context, fd int) error {
 			}
 			buf := req.Encode()
 			if _, err := syscall.Write(fd, buf); err != nil {
-				return fmt.Errorf("failed to write ping message to fd: %w", err)
+				return fmt.Errorf("failed to write connect message to fd: %w", err)
 			}
 			slog.DebugContext(ctx, "rpc request to client was sent")
 		}
 	}
+}
+
+func (h *ClientHandler) Hello(ctx context.Context, fd int) error {
+	rpc := RPCRequest{method: Hello}
+	buf := rpc.Encode()
+	if _, err := syscall.Write(fd, buf); err != nil {
+		return fmt.Errorf("failed to write hello message to fd: %w", err)
+	}
+	slog.DebugContext(ctx, "hello message was sent")
+	return nil
 }
 
 func (h *ClientHandler) Close() {}
@@ -479,6 +511,8 @@ func (h *ProxyHandler) Handle(ctx context.Context, fd int) error {
 	return nil
 }
 
+func (h *ProxyHandler) Hello(context.Context, int) error { return nil }
+
 func (h *ProxyHandler) Close() {
 	// Only this handler writes to this channel so it should close it.
 	for _, ch := range h.incomingResC {
@@ -525,6 +559,8 @@ func (h *IncomingHandler) Handle(ctx context.Context, fd int) error {
 
 	return nil
 }
+
+func (h *IncomingHandler) Hello(context.Context, int) error { return nil }
 
 func (h *IncomingHandler) Close() {
 	// This function is called when all incoming connections are closed.
@@ -702,7 +738,9 @@ func RandomConnID() ConnID {
 type RPCMethod uint8
 
 const (
-	Ping RPCMethod = iota + 1
+	Hello RPCMethod = iota + 1
+	Busy
+	Ping
 	Pong
 	Connect
 	Ack
@@ -710,6 +748,10 @@ const (
 
 func (m RPCMethod) String() string {
 	switch m {
+	case Hello:
+		return "hello"
+	case Busy:
+		return "busy"
 	case Ping:
 		return "ping"
 	case Pong:
