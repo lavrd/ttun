@@ -75,6 +75,7 @@ func (cmd *CmdClient) Run() error {
 	select {
 	case sig := <-interrupt:
 		slog.DebugContext(ctx, "received os signal", "signal", sig.String())
+		// To close all goroutines and streams copying.
 		cancel()
 		if err := <-errC; err != nil {
 			return fmt.Errorf("failed to wait for proxy connection: %w", err)
@@ -136,16 +137,20 @@ func (cmd *CmdServer) Run() error {
 	go func() { errC <- il.Listen(ctx, false) }()
 
 	interrupt := make(chan os.Signal, 1)
+	defer close(interrupt)
 	signal.Notify(interrupt, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
 
 	select {
 	case err := <-errC:
 		slog.ErrorContext(ctx, "received an error from channel", "error", err)
 		cancel()
+		// As one listener is already stopped as we received an error from the channel.
+		// We need to wait only for two remaining listeners.
 		DrainErrC(ctx, errC, 2)
 	case sig := <-interrupt:
 		slog.DebugContext(ctx, "received os signal", "signal", sig.String())
 		cancel()
+		// We want to wait for all three listeners.
 		DrainErrC(ctx, errC, 3)
 	}
 
@@ -155,7 +160,7 @@ func (cmd *CmdServer) Run() error {
 func DrainErrC(ctx context.Context, errC chan error, remaining int) {
 	for i := 0; i < remaining; i++ {
 		if err := <-errC; err != nil {
-			slog.ErrorContext(ctx, "received error from channel", "error", err)
+			slog.ErrorContext(ctx, "received error from channel while draining", "error", err)
 		}
 	}
 }
@@ -198,9 +203,14 @@ func InitProxyConnection(ctx context.Context, proxyAddress, incomingAddress, tar
 			if err = group.Wait(); err != nil {
 				return fmt.Errorf("failed to wait for all proxy connections: %w", err)
 			}
-			slog.DebugContext(ctx, "all goroutines are closed")
+			slog.DebugContext(ctx, "all goroutines and proxy connections are stopped")
 			return nil
 		case <-helloT.C:
+			// Sometimes socket can "establish" connection with proxy server,
+			// 	but actually there are no real connection between them.
+			// To be sure that connection is really established we need to wait
+			// 	for hello message from the server.
+			// If there are no message until timer is up, it means we are not connected.
 			slog.InfoContext(ctx, "hello message from the server is not received")
 			return nil
 		default:
@@ -226,8 +236,13 @@ func InitProxyConnection(ctx context.Context, proxyAddress, incomingAddress, tar
 		}
 		switch req.method {
 		case Hello:
+			// As we received hello message from the server,
+			//  it means we are successfully connected and can receive
+			//  rpc requests from the server.
+			// So we need to stop timer to not exit server loop.
 			helloT.Stop()
 		case Busy:
+			// It means other client is already connected to the server.
 			slog.InfoContext(ctx, "server is busy with another client")
 			return nil
 		case Ping:
@@ -264,15 +279,6 @@ func InitIncomingConnection(ctx context.Context, connID ConnID, incomingAddress,
 	}()
 	slog.DebugContext(ctx, "incoming socket is established", "fd", incomingSocket)
 
-	req := RPCRequest{
-		method: Ack,
-		connID: connID,
-	}
-	buf := req.Encode()
-	if _, err = syscall.Write(incomingSocket, buf); err != nil {
-		return fmt.Errorf("failed to write to incoming rpc request: %w", err)
-	}
-
 	targetSocket, err := Dial(ctx, targetAddress, false)
 	if err != nil {
 		return fmt.Errorf("failed to dial target: %w", err)
@@ -285,12 +291,16 @@ func InitIncomingConnection(ctx context.Context, connID ConnID, incomingAddress,
 	}()
 	slog.DebugContext(ctx, "target socket is established", "fd", targetSocket)
 
-	slog.DebugContext(ctx, "start copy streams")
-	if err = CopyStreams(ctx, incomingSocket, targetSocket); err != nil {
-		return fmt.Errorf("failed to copy streams: %w", err)
+	req := RPCRequest{
+		method: Ack,
+		connID: connID,
 	}
-	slog.DebugContext(ctx, "copy streams is finished")
+	buf := req.Encode()
+	if _, err = syscall.Write(incomingSocket, buf); err != nil {
+		return fmt.Errorf("failed to write to incoming rpc request: %w", err)
+	}
 
+	CopyStreams(ctx, incomingSocket, targetSocket)
 	return nil
 }
 
@@ -309,10 +319,11 @@ type Listener[T Handler] struct {
 
 func (l *Listener[T]) Listen(ctx context.Context, nonblock bool) error {
 	ctx = CtxWithAttr(ctx, slog.String("id", l.handler.ID()))
+	defer l.handler.Close()
 
 	socket, err := CreateSocket(true)
 	if err != nil {
-		return fmt.Errorf("failed to init socket: %w", err)
+		return fmt.Errorf("failed to create socket: %w", err)
 	}
 	if err = ListenOnSocket(socket, l.port); err != nil {
 		return fmt.Errorf("failed to listen socket: %w", err)
@@ -328,14 +339,11 @@ func (l *Listener[T]) Listen(ctx context.Context, nonblock bool) error {
 			if err = group.Wait(); err != nil {
 				slog.ErrorContext(ctx, "failed to wait for goroutines", "error", err)
 			}
-			l.handler.Close()
 			return nil
 		default:
 		}
 
-		var fd int
-		var addr syscall.Sockaddr
-		fd, addr, err = syscall.Accept(socket)
+		fd, addr, err := syscall.Accept(socket)
 		if err != nil {
 			if errors.Is(err, syscall.EAGAIN) {
 				time.Sleep(time.Millisecond * 5)
@@ -382,7 +390,7 @@ func InitListenerHandler(
 				slog.ErrorContext(ctx, "failed to close fd", "error", err)
 				return
 			}
-			slog.DebugContext(ctx, "fd closed")
+			slog.DebugContext(ctx, "connection fd is successfully closed")
 		}()
 		if err := handler.Hello(ctx, fd); err != nil {
 			return fmt.Errorf("failed to say hello: %w", err)
@@ -400,17 +408,19 @@ func (h *ClientHandler) ID() string { return "client-handler" }
 func (h *ClientHandler) Handle(ctx context.Context, fd int) error {
 	t := time.NewTimer(time.Second)
 	defer t.Stop()
+
+	req := RPCRequest{method: Ping}
+	reqBuf := req.Encode()
+	resBuf := make([]byte, NetworkBufSize)
+
 	for {
 		select {
 		case <-t.C:
-			req := RPCRequest{method: Ping}
-			buf := req.Encode()
-			if _, err := syscall.Write(fd, buf); err != nil {
+			if _, err := syscall.Write(fd, reqBuf); err != nil {
 				return fmt.Errorf("failed to ping client: %w", err)
 			}
-			buf = make([]byte, NetworkBufSize)
 			for {
-				n, err := syscall.Read(fd, buf)
+				n, err := syscall.Read(fd, resBuf)
 				if errors.Is(err, syscall.EAGAIN) {
 					time.Sleep(time.Millisecond * 5)
 					continue
@@ -422,9 +432,10 @@ func (h *ClientHandler) Handle(ctx context.Context, fd int) error {
 					slog.DebugContext(ctx, "client was disconnected")
 					return nil
 				}
+				resBuf = resBuf[:n]
 				req = RPCRequest{}
-				if err = req.Decode(buf[:n]); err != nil {
-					return fmt.Errorf("failed to decode rpc request: %w", err)
+				if err = req.Decode(resBuf); err != nil {
+					return fmt.Errorf("failed to decode rpc request (maybe pong): %w", err)
 				}
 				if req.method != Pong {
 					slog.ErrorContext(ctx, "response method should be pong after ping request", "method", req.method)
@@ -434,6 +445,8 @@ func (h *ClientHandler) Handle(ctx context.Context, fd int) error {
 			}
 			t.Reset(time.Second)
 		case connID, ok := <-h.incomingReqC:
+			// So new incoming connection is established.
+			// We need to ask client to open new connection to start data proxy streams.
 			if !ok {
 				slog.DebugContext(ctx, "incoming request channel was closed")
 				return nil
@@ -490,6 +503,7 @@ func (h *ProxyHandler) Handle(ctx context.Context, fd int) error {
 	if err := req.Decode(buf); err != nil {
 		return fmt.Errorf("failed to decode request: %w", err)
 	}
+	// Client should answer that target connection is established and it is ready to proxy traffic.
 	if req.method != Ack {
 		slog.DebugContext(ctx, "rpc request message is not ack", "method", req.method)
 		return nil
@@ -543,20 +557,19 @@ func (h *IncomingHandler) Handle(ctx context.Context, fd int) error {
 	h.incomingReqC <- connID
 	slog.DebugContext(ctx, "new incoming request was sent")
 
+	// New client is connected to proxy server and there is fd.
 	proxyFd := <-incomingResC
 	slog.DebugContext(ctx, "received proxy fd", "proxy_fd", proxyFd)
 
 	closeProxyFd := h.closeProxyFd[connID]
 	defer func() {
+		// Notify proxy connection that streams are done and connection can be closed.
 		closeProxyFd <- struct{}{}
 		close(closeProxyFd)
 		delete(h.closeProxyFd, connID)
 	}()
 
-	if err := CopyStreams(ctx, fd, proxyFd); err != nil {
-		return fmt.Errorf("failed to copy streams: %w", err)
-	}
-
+	CopyStreams(ctx, fd, proxyFd)
 	return nil
 }
 
@@ -580,8 +593,8 @@ func CopyData[T int | uintptr](ctx context.Context, srcFd, dstFd T, errC chan er
 
 	buf := make([]byte, NetworkBufSize)
 	for {
-		// Received stop os signal.
 		select {
+		// Received stop os signal.
 		case <-ctx.Done():
 			slog.DebugContext(ctx, "stop signal received on reading, stop copying data")
 			errC <- nil
@@ -595,7 +608,7 @@ func CopyData[T int | uintptr](ctx context.Context, srcFd, dstFd T, errC chan er
 				time.Sleep(time.Millisecond * 5)
 				continue
 			}
-			errC <- SpawnCopyDataErr("failed to read from source socket", err, srcFd, dstFd)
+			errC <- PrepareCopyDataErr("failed to read from source socket", err, srcFd, dstFd)
 			return
 		}
 		if n == 0 {
@@ -603,6 +616,7 @@ func CopyData[T int | uintptr](ctx context.Context, srcFd, dstFd T, errC chan er
 			errC <- nil
 			return
 		}
+		buf = buf[:n]
 
 		for {
 			select {
@@ -613,13 +627,13 @@ func CopyData[T int | uintptr](ctx context.Context, srcFd, dstFd T, errC chan er
 			default:
 			}
 
-			_, err = syscall.Write(int(dstFd), buf[:n])
+			_, err = syscall.Write(int(dstFd), buf)
 			if errors.Is(err, syscall.EAGAIN) {
 				time.Sleep(time.Millisecond * 5)
 				continue
 			}
 			if err != nil {
-				errC <- SpawnCopyDataErr("failed to write to destination socket", err, srcFd, dstFd)
+				errC <- PrepareCopyDataErr("failed to write to destination socket", err, srcFd, dstFd)
 				return
 			}
 			break
@@ -627,36 +641,32 @@ func CopyData[T int | uintptr](ctx context.Context, srcFd, dstFd T, errC chan er
 	}
 }
 
-func SpawnCopyDataErr[T int | uintptr](message string, err error, srcFd, dstFd T) error {
+func PrepareCopyDataErr[T int | uintptr](message string, err error, srcFd, dstFd T) error {
 	return fmt.Errorf("%s: src_fd=%d;dst_fd=%d: %w", message, srcFd, dstFd, err)
 }
 
-func CopyStreams[T int | uintptr](ctx context.Context, srcFd, dstFd T) error {
+func CopyStreams[T int | uintptr](ctx context.Context, srcFd, dstFd T) {
 	errC := make(chan error)
 	defer close(errC)
 	go CopyData(ctx, srcFd, dstFd, errC)
 	go CopyData(ctx, dstFd, srcFd, errC)
-	slog.DebugContext(ctx, "copy goroutines are started")
-	var lastErr error
+	slog.DebugContext(ctx, "goroutines to copy streams are started")
 	for i := 0; i < 2; i++ {
 		if err := <-errC; err != nil {
 			slog.ErrorContext(ctx, "received error from copy data goroutine", "error", err)
-			lastErr = err
 		}
-		slog.DebugContext(ctx, "one goroutine is stopped")
 	}
-	slog.DebugContext(ctx, "copy goroutines are stopped")
-	return lastErr
+	slog.DebugContext(ctx, "goroutines to copy streams are stopped")
 }
 
 func CreateSocket(nonblock bool) (int, error) {
 	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, syscall.IPPROTO_TCP)
 	if err != nil {
-		return 0, fmt.Errorf("failed init socket: %w", err)
+		return 0, fmt.Errorf("failed to create socket: %w", err)
 	}
 	if nonblock {
 		if err = syscall.SetNonblock(fd, true); err != nil {
-			return 0, fmt.Errorf("failed to set nonblock: %w", err)
+			return 0, fmt.Errorf("failed to set socket nonblock: %w", err)
 		}
 	}
 	return fd, nil
@@ -666,17 +676,17 @@ func ListenOnSocket(fd, port int) error {
 	addr := syscall.SockaddrInet4{Port: port}
 	copy(addr.Addr[:], []byte{0, 0, 0, 0})
 	if err := syscall.Bind(fd, &addr); err != nil {
-		return fmt.Errorf("failed to bind to address: %w", err)
+		return fmt.Errorf("failed to bind socket to address: %w", err)
 	}
 	if err := syscall.Listen(fd, syscall.SOMAXCONN); err != nil {
-		return fmt.Errorf("failed to listen: %w", err)
+		return fmt.Errorf("failed to listen on socket: %w", err)
 	}
 	return nil
 }
 
 func ShutdownSocket[T int | uintptr](ctx context.Context, fd T) {
 	ctx = CtxWithAttr(ctx, slog.Int("fd", int(fd)))
-	slog.DebugContext(ctx, "shut down socket")
+	slog.DebugContext(ctx, "try to shut down socket")
 	if err := syscall.Shutdown(int(fd), syscall.SHUT_WR); err != nil {
 		slog.ErrorContext(ctx, "failed to shut down socket", "error", err)
 	}
@@ -685,7 +695,7 @@ func ShutdownSocket[T int | uintptr](ctx context.Context, fd T) {
 func Dial(ctx context.Context, address *net.TCPAddr, nonblocking bool) (int, error) {
 	socket, err := CreateSocket(nonblocking)
 	if err != nil {
-		return 0, fmt.Errorf("failed to init socket: %w", err)
+		return 0, fmt.Errorf("failed to create socket: %w", err)
 	}
 	sockaddr := syscall.SockaddrInet4{Port: address.Port}
 	copy(sockaddr.Addr[:], address.IP.To4())
@@ -698,7 +708,7 @@ func Dial(ctx context.Context, address *net.TCPAddr, nonblocking bool) (int, err
 			continue
 		}
 		if errors.Is(err, syscall.EALREADY) {
-			slog.DebugContext(ctx, "connection is already established", "error", err)
+			slog.DebugContext(ctx, "socket connection is already established", "error", err)
 			return socket, nil
 		}
 		if err != nil {
@@ -722,9 +732,7 @@ const ConnIDSize = 12
 
 type ConnID [ConnIDSize]byte
 
-func (c ConnID) String() string {
-	return string(c[:])
-}
+func (c ConnID) String() string { return string(c[:]) }
 
 func RandomConnID() ConnID {
 	letterRunes := []byte("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
@@ -894,7 +902,7 @@ func (h *SlogHandler) printText(r slog.Record) {
 	case slog.LevelDebug, slog.LevelError:
 		level = r.Level.String()
 	default:
-		// To make all levels aligned (text).
+		// To make all levels aligned (column text alignment).
 		level = r.Level.String() + " "
 	}
 	level += " "

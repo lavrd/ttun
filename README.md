@@ -1,14 +1,15 @@
 # ttun
 
-Transport layer tunnel.
+Simple transport layer tunnel which can be used as a reverse proxy to serve your local traffic (localhost) publicity.
 
-This tunnel can be used to proxy HTTP requests from publicity available server to localhost.
+## Usage
 
 ```shell
 Usage: ttun <command> [flags]
 
 Flags:
-  -h, --help    Show context-sensitive help.
+  -h, --help         Show context-sensitive help.
+      --json-logs    Print logs in json.
 
 Commands:
   client [flags]
@@ -19,3 +20,23 @@ Commands:
 
 Run "ttun <command> --help" for more information on a command.
 ```
+
+Docker should be up and running.
+
+```shell
+# Run server with mock data.
+cd mock/custom && make run_docker
+# Build docker image with client and server.
+make build_docker
+# Run server.
+make run_docker_server
+# Run client.
+make run_docker_client
+# Try to download some data through tunnel.
+make curl_download_bytes
+# Or.
+make curl_download_image
+# You can find downloaded files in curl-test-data folder.
+```
+
+To make this demo working automatically you should stop all containers before starting it.
