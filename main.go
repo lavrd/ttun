@@ -13,6 +13,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -97,14 +98,14 @@ func (cmd *CmdServer) Run() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	handshakeReqC := make(chan ConnID)
-	handshakeResC := make(map[ConnID]chan int)
+	incomingReqC := make(chan ConnID)
+	incomingResC := make(map[ConnID]chan int)
 	closeProxyFd := make(map[ConnID]chan struct{})
 
 	cl := &Listener[*ClientHandler]{
 		port: cmd.ClientPort,
 		handler: &ClientHandler{
-			handshakeReqC: handshakeReqC,
+			incomingReqC: incomingReqC,
 		},
 		// We want to have only one active client at one moment.
 		maxConns: 1,
@@ -112,37 +113,51 @@ func (cmd *CmdServer) Run() error {
 	pl := &Listener[*ProxyHandler]{
 		port: cmd.ProxyPort,
 		handler: &ProxyHandler{
-			handshakeResC: handshakeResC,
-			closeProxyFd:  closeProxyFd,
+			incomingResC: incomingResC,
+			closeProxyFd: closeProxyFd,
 		},
 		maxConns: math.MaxInt,
 	}
 	il := &Listener[*IncomingHandler]{
 		port: cmd.IncomingPort,
 		handler: &IncomingHandler{
-			handshakeReqC: handshakeReqC,
-			handshakeResC: handshakeResC,
-			closeProxyFd:  closeProxyFd,
+			incomingReqC: incomingReqC,
+			incomingResC: incomingResC,
+			closeProxyFd: closeProxyFd,
 		},
 		maxConns: math.MaxInt,
 	}
 
-	group := new(errgroup.Group)
-	group.Go(func() error { return cl.Listen(ctx, true) })
-	group.Go(func() error { return pl.Listen(ctx, false) })
-	group.Go(func() error { return il.Listen(ctx, false) })
+	errC := make(chan error)
+	defer close(errC)
+
+	go func() { errC <- cl.Listen(ctx, true) }()
+	go func() { errC <- pl.Listen(ctx, false) }()
+	go func() { errC <- il.Listen(ctx, false) }()
 
 	interrupt := make(chan os.Signal, 1)
 	signal.Notify(interrupt, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
-	signalName := (<-interrupt).String()
-	slog.DebugContext(ctx, "received os signal", "signal", signalName)
-	cancel()
 
-	if err := group.Wait(); err != nil {
-		return fmt.Errorf("failed to wait for goroutines: %w", err)
+	select {
+	case err := <-errC:
+		slog.ErrorContext(ctx, "received an error from channel", "error", err)
+		cancel()
+		DrainErrC(ctx, errC, 2)
+	case sig := <-interrupt:
+		slog.DebugContext(ctx, "received os signal", "signal", sig.String())
+		cancel()
+		DrainErrC(ctx, errC, 3)
 	}
 
 	return nil
+}
+
+func DrainErrC(ctx context.Context, errC chan error, remaining int) {
+	for i := 0; i < remaining; i++ {
+		if err := <-errC; err != nil {
+			slog.ErrorContext(ctx, "received error from channel", "error", err)
+		}
+	}
 }
 
 func InitProxyConnection(ctx context.Context, proxyAddress, incomingAddress, targetAddress string) error {
@@ -355,7 +370,7 @@ func InitListenerHandler(
 }
 
 type ClientHandler struct {
-	handshakeReqC chan ConnID
+	incomingReqC chan ConnID
 }
 
 func (h *ClientHandler) ID() string { return "client-handler" }
@@ -396,13 +411,13 @@ func (h *ClientHandler) Handle(ctx context.Context, fd int) error {
 				break
 			}
 			t.Reset(time.Second)
-		case connID, ok := <-h.handshakeReqC:
+		case connID, ok := <-h.incomingReqC:
 			if !ok {
-				slog.DebugContext(ctx, "handshake request channel was closed")
+				slog.DebugContext(ctx, "incoming request channel was closed")
 				return nil
 			}
 			ctx = CtxWithAttr(ctx, slog.String("conn_id", connID.String()))
-			slog.DebugContext(ctx, "received new handshake")
+			slog.DebugContext(ctx, "received new incoming request")
 			req := RPCRequest{
 				method: Connect,
 				connID: connID,
@@ -419,8 +434,8 @@ func (h *ClientHandler) Handle(ctx context.Context, fd int) error {
 func (h *ClientHandler) Close() {}
 
 type ProxyHandler struct {
-	handshakeResC map[ConnID]chan int
-	closeProxyFd  map[ConnID]chan struct{}
+	incomingResC map[ConnID]chan int
+	closeProxyFd map[ConnID]chan struct{}
 }
 
 func (h *ProxyHandler) ID() string { return "proxy-handler" }
@@ -448,16 +463,16 @@ func (h *ProxyHandler) Handle(ctx context.Context, fd int) error {
 		return nil
 	}
 
-	handshakeResC := h.handshakeResC[req.connID]
+	incomingResC := h.incomingResC[req.connID]
 	defer func() {
-		close(handshakeResC)
-		delete(h.handshakeResC, req.connID)
+		close(incomingResC)
+		delete(h.incomingResC, req.connID)
 	}()
 
 	closeProxyFd := make(chan struct{})
 	h.closeProxyFd[req.connID] = closeProxyFd
 
-	handshakeResC <- fd
+	incomingResC <- fd
 
 	<-closeProxyFd
 
@@ -466,15 +481,15 @@ func (h *ProxyHandler) Handle(ctx context.Context, fd int) error {
 
 func (h *ProxyHandler) Close() {
 	// Only this handler writes to this channel so it should close it.
-	for _, ch := range h.handshakeResC {
+	for _, ch := range h.incomingResC {
 		close(ch)
 	}
 }
 
 type IncomingHandler struct {
-	handshakeReqC chan ConnID
-	handshakeResC map[ConnID]chan int
-	closeProxyFd  map[ConnID]chan struct{}
+	incomingReqC chan ConnID
+	incomingResC map[ConnID]chan int
+	closeProxyFd map[ConnID]chan struct{}
 }
 
 func (h *IncomingHandler) ID() string { return "incoming-handler" }
@@ -484,17 +499,17 @@ func (h *IncomingHandler) Handle(ctx context.Context, fd int) error {
 	ctx = CtxWithAttr(ctx, slog.String("conn_id", connID.String()))
 
 	// We need to set up and save this channel,
-	// before send handshake request to client handler,
+	// before send incoming request to client handler,
 	// otherwise there will be panic in client handler,
 	// because it will not find a proper channel with exact connection id.
-	handshakeResC := make(chan int)
-	h.handshakeResC[connID] = handshakeResC
+	incomingResC := make(chan int)
+	h.incomingResC[connID] = incomingResC
 
 	// Send request to establish new proxy connection.
-	h.handshakeReqC <- connID
-	slog.DebugContext(ctx, "handshake request was sent")
+	h.incomingReqC <- connID
+	slog.DebugContext(ctx, "new incoming request was sent")
 
-	proxyFd := <-handshakeResC
+	proxyFd := <-incomingResC
 	slog.DebugContext(ctx, "received proxy fd", "proxy_fd", proxyFd)
 
 	closeProxyFd := h.closeProxyFd[connID]
@@ -514,7 +529,7 @@ func (h *IncomingHandler) Handle(ctx context.Context, fd int) error {
 func (h *IncomingHandler) Close() {
 	// This function is called when all incoming connections are closed.
 	// So we need to close this channel because no one will write to it.
-	close(h.handshakeReqC)
+	close(h.incomingReqC)
 	// Only this handler writes to this channel so it should close it.
 	for _, ch := range h.closeProxyFd {
 		close(ch)
@@ -769,6 +784,7 @@ func CtxWithAttr(ctx context.Context, attr slog.Attr) context.Context {
 
 type LogEvent struct {
 	Time    string            `json:"time"`
+	Level   string            `json:"level"`
 	Message string            `json:"message"`
 	Data    map[string]string `json:"data"`
 }
@@ -851,6 +867,7 @@ func (h *SlogHandler) printJson(r slog.Record) error {
 	})
 	logEvent := LogEvent{
 		Time:    r.Time.Format(time.RFC3339),
+		Level:   strings.ToLower(r.Level.String()),
 		Message: r.Message,
 		Data:    attrs,
 	}
