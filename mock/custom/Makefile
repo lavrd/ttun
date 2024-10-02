@@ -6,7 +6,7 @@ run_docker: build_docker
 		--name mock-custom \
 		-p 12300:44000 \
 		-v "${PWD}/../data/:/data/" \
-		mock-custom run
+		mock-custom server
 
 gen_mock_bytes:
 	@go run . gen

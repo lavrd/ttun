@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -22,22 +23,28 @@ import (
 const NetworkBufSize = 256
 
 func main() {
+	cmd := &Cmd{}
+	kctx := kong.Parse(cmd)
+
 	slogHandler := NewSlogHandler(
 		os.Stdout,
 		&slog.HandlerOptions{
 			Level:     slog.LevelDebug,
 			AddSource: true,
-		})
+		},
+		cmd.JsonLogs,
+	)
 	slog.SetDefault(slog.New(slogHandler))
 
-	kongCtx := kong.Parse(&Cmd{})
-	if err := kongCtx.Run(); err != nil {
+	if err := kctx.Run(); err != nil {
 		slog.Error("failed to run command", "error", err)
 		os.Exit(1)
 	}
 }
 
 type Cmd struct {
+	JsonLogs bool `default:"false" help:"Print logs in json."`
+
 	Client CmdClient `cmd:"" help:"Start client side."`
 	Server CmdServer `cmd:"" help:"Start server side."`
 }
@@ -153,8 +160,7 @@ func InitProxyConnection(ctx context.Context) error {
 		default:
 		}
 
-		var n int
-		n, err = syscall.Read(socket, buf)
+		n, err := syscall.Read(socket, buf)
 		if err != nil {
 			if errors.Is(err, syscall.EAGAIN) {
 				time.Sleep(time.Millisecond * 5)
@@ -247,11 +253,11 @@ type Listener[T Handler] struct {
 func (l *Listener[T]) Listen(ctx context.Context, nonblock bool) error {
 	ctx = CtxWithAttr(ctx, slog.String("id", l.handler.ID()))
 
-	socket, err := InitSocket(true)
+	socket, err := CreateSocket(true)
 	if err != nil {
 		return fmt.Errorf("failed to init socket: %w", err)
 	}
-	if err = ListenSocket(socket, l.port); err != nil {
+	if err = ListenOnSocket(socket, l.port); err != nil {
 		return fmt.Errorf("failed to listen socket: %w", err)
 	}
 	slog.DebugContext(ctx, "listen for connections to socket", "port", l.port)
@@ -290,6 +296,25 @@ func (l *Listener[T]) Listen(ctx context.Context, nonblock bool) error {
 			slog.WarnContext(ctx, "cannot init new connection because of goroutines limit")
 			continue
 		}
+	}
+}
+
+func InitListenerHandler(
+	ctx context.Context, fd int, addr syscall.Sockaddr, handler Handler,
+) func() error {
+
+	return func() error {
+		ctx = CtxWithAttr(ctx, slog.Int("fd", fd))
+		ctx = CtxWithAttr(ctx, slog.String("addr", SockaddrToString(addr)))
+		slog.DebugContext(ctx, "new connection")
+		defer func() {
+			if err := syscall.Close(fd); err != nil {
+				slog.ErrorContext(ctx, "failed to close fd", "error", err)
+				return
+			}
+			slog.DebugContext(ctx, "fd closed")
+		}()
+		return handler.Handle(ctx, fd)
 	}
 }
 
@@ -460,39 +485,6 @@ func (h *IncomingHandler) Close() {
 	}
 }
 
-func InitSocket(nonblock bool) (int, error) {
-	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, syscall.IPPROTO_TCP)
-	if err != nil {
-		return 0, fmt.Errorf("failed init socket: %w", err)
-	}
-	if nonblock {
-		if err = syscall.SetNonblock(fd, true); err != nil {
-			return 0, fmt.Errorf("failed to set nonblock: %w", err)
-		}
-	}
-	return fd, nil
-}
-
-func ListenSocket(fd, port int) error {
-	addr := syscall.SockaddrInet4{Port: port}
-	copy(addr.Addr[:], []byte{0, 0, 0, 0})
-	if err := syscall.Bind(fd, &addr); err != nil {
-		return fmt.Errorf("failed to bind to address: %w", err)
-	}
-	if err := syscall.Listen(fd, syscall.SOMAXCONN); err != nil {
-		return fmt.Errorf("failed to listen: %w", err)
-	}
-	return nil
-}
-
-func ShutdownSocket[T int | uintptr](ctx context.Context, fd T) {
-	ctx = CtxWithAttr(ctx, slog.Int("fd", int(fd)))
-	slog.DebugContext(ctx, "shut down socket")
-	if err := syscall.Shutdown(int(fd), syscall.SHUT_WR); err != nil {
-		slog.ErrorContext(ctx, "failed to shut down socket", "error", err)
-	}
-}
-
 func CopyData[T int | uintptr](ctx context.Context, srcFd, dstFd T, errC chan error) {
 	ctx = CtxWithAttr(ctx, slog.Int("src_fd", int(srcFd)))
 	ctx = CtxWithAttr(ctx, slog.Int("dst_fd", int(dstFd)))
@@ -570,22 +562,36 @@ func CopyStreams[T int | uintptr](ctx context.Context, srcFd, dstFd T) error {
 	return lastErr
 }
 
-func InitListenerHandler(
-	ctx context.Context, fd int, addr syscall.Sockaddr, handler Handler,
-) func() error {
+func CreateSocket(nonblock bool) (int, error) {
+	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, syscall.IPPROTO_TCP)
+	if err != nil {
+		return 0, fmt.Errorf("failed init socket: %w", err)
+	}
+	if nonblock {
+		if err = syscall.SetNonblock(fd, true); err != nil {
+			return 0, fmt.Errorf("failed to set nonblock: %w", err)
+		}
+	}
+	return fd, nil
+}
 
-	return func() error {
-		ctx = CtxWithAttr(ctx, slog.Int("fd", fd))
-		ctx = CtxWithAttr(ctx, slog.String("addr", SockaddrToString(addr)))
-		slog.DebugContext(ctx, "new connection")
-		defer func() {
-			if err := syscall.Close(fd); err != nil {
-				slog.ErrorContext(ctx, "failed to close fd", "error", err)
-				return
-			}
-			slog.DebugContext(ctx, "fd closed")
-		}()
-		return handler.Handle(ctx, fd)
+func ListenOnSocket(fd, port int) error {
+	addr := syscall.SockaddrInet4{Port: port}
+	copy(addr.Addr[:], []byte{0, 0, 0, 0})
+	if err := syscall.Bind(fd, &addr); err != nil {
+		return fmt.Errorf("failed to bind to address: %w", err)
+	}
+	if err := syscall.Listen(fd, syscall.SOMAXCONN); err != nil {
+		return fmt.Errorf("failed to listen: %w", err)
+	}
+	return nil
+}
+
+func ShutdownSocket[T int | uintptr](ctx context.Context, fd T) {
+	ctx = CtxWithAttr(ctx, slog.Int("fd", int(fd)))
+	slog.DebugContext(ctx, "shut down socket")
+	if err := syscall.Shutdown(int(fd), syscall.SHUT_WR); err != nil {
+		slog.ErrorContext(ctx, "failed to shut down socket", "error", err)
 	}
 }
 
@@ -595,7 +601,7 @@ func Dial(ctx context.Context, address string, nonblocking bool) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("failed to resolve tcp address: %w", err)
 	}
-	socket, err := InitSocket(nonblocking)
+	socket, err := CreateSocket(nonblocking)
 	if err != nil {
 		return 0, fmt.Errorf("failed to init socket: %w", err)
 	}
@@ -728,21 +734,30 @@ func CtxWithAttr(ctx context.Context, attr slog.Attr) context.Context {
 	return context.WithValue(ctx, CtxKeySlogFields, attrs)
 }
 
+type LogEvent struct {
+	Time    string            `json:"time"`
+	Message string            `json:"message"`
+	Data    map[string]string `json:"data"`
+}
+
 type SlogHandler struct {
 	slog.Handler
-	l     *log.Logger
-	attrs []slog.Attr
+	l        *log.Logger
+	attrs    []slog.Attr
+	jsonLogs bool
 }
 
 func NewSlogHandler(
 	out io.Writer,
 	opts *slog.HandlerOptions,
+	jsonLogs bool,
 ) *SlogHandler {
 
 	return &SlogHandler{
-		Handler: slog.NewTextHandler(out, opts),
-		l:       log.New(out, "", 0),
-		attrs:   make([]slog.Attr, 0),
+		Handler:  slog.NewTextHandler(out, opts),
+		l:        log.New(out, "", 0),
+		attrs:    make([]slog.Attr, 0),
+		jsonLogs: jsonLogs,
 	}
 }
 
@@ -755,6 +770,24 @@ func (h *SlogHandler) Handle(ctx context.Context, r slog.Record) error {
 	for _, v := range h.attrs {
 		r.AddAttrs(v)
 	}
+	if h.jsonLogs {
+		return h.printJson(r)
+	}
+	h.printText(r)
+	return nil
+}
+
+func (h *SlogHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	slogAttrs := h.attrs
+	slogAttrs = append(slogAttrs, attrs...)
+	return &SlogHandler{
+		Handler: h.Handler,
+		l:       h.l,
+		attrs:   slogAttrs,
+	}
+}
+
+func (h *SlogHandler) printText(r slog.Record) {
 	attrs := []byte(" ")
 	r.Attrs(func(a slog.Attr) bool {
 		attrs = append(attrs, []byte(fmt.Sprintf(`%s="%v" `, a.Key, a.Value.String()))...)
@@ -775,15 +808,23 @@ func (h *SlogHandler) Handle(ctx context.Context, r slog.Record) error {
 	}
 	level += " "
 	h.l.Println(timeStr, level, r.Message, string(attrs))
-	return nil
 }
 
-func (h *SlogHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
-	slogAttrs := h.attrs
-	slogAttrs = append(slogAttrs, attrs...)
-	return &SlogHandler{
-		Handler: h.Handler,
-		l:       h.l,
-		attrs:   slogAttrs,
+func (h *SlogHandler) printJson(r slog.Record) error {
+	attrs := make(map[string]string, r.NumAttrs())
+	r.Attrs(func(a slog.Attr) bool {
+		attrs[a.Key] = a.Value.String()
+		return true
+	})
+	logEvent := LogEvent{
+		Time:    r.Time.Format(time.RFC3339),
+		Message: r.Message,
+		Data:    attrs,
 	}
+	buf, err := json.Marshal(logEvent)
+	if err != nil {
+		return fmt.Errorf("failed to marshal log event: %w", err)
+	}
+	h.l.Println(string(buf))
+	return nil
 }
