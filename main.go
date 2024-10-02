@@ -49,7 +49,11 @@ type Cmd struct {
 	Server CmdServer `cmd:"" help:"Start server side."`
 }
 
-type CmdClient struct{}
+type CmdClient struct {
+	ProxyAddress    string `default:"172.17.0.3:22000" help:"Set server proxy address."`
+	IncomingAddress string `default:"172.17.0.3:32345" help:"Set server incoming address."`
+	TargetAddress   string `default:"172.17.0.2:44000" help:"Set target address."`
+}
 
 func (cmd *CmdClient) Run() error {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -62,7 +66,10 @@ func (cmd *CmdClient) Run() error {
 	defer close(interrupt)
 	signal.Notify(interrupt, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
 
-	go func() { errC <- InitProxyConnection(ctx) }()
+	go func() {
+		errC <- InitProxyConnection(ctx,
+			cmd.ProxyAddress, cmd.IncomingAddress, cmd.TargetAddress)
+	}()
 
 	select {
 	case sig := <-interrupt:
@@ -80,7 +87,11 @@ func (cmd *CmdClient) Run() error {
 	return nil
 }
 
-type CmdServer struct{}
+type CmdServer struct {
+	ClientPort   int `default:"22000" help:"Set client port."`
+	ProxyPort    int `default:"32345" help:"Set incoming port."`
+	IncomingPort int `default:"14600" help:"Set incoming port."`
+}
 
 func (cmd *CmdServer) Run() error {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -91,7 +102,7 @@ func (cmd *CmdServer) Run() error {
 	closeProxyFd := make(map[ConnID]chan struct{})
 
 	cl := &Listener[*ClientHandler]{
-		port: 22000,
+		port: cmd.ClientPort,
 		handler: &ClientHandler{
 			handshakeReqC: handshakeReqC,
 		},
@@ -99,7 +110,7 @@ func (cmd *CmdServer) Run() error {
 		maxConns: 1,
 	}
 	pl := &Listener[*ProxyHandler]{
-		port: 32345,
+		port: cmd.ProxyPort,
 		handler: &ProxyHandler{
 			handshakeResC: handshakeResC,
 			closeProxyFd:  closeProxyFd,
@@ -107,7 +118,7 @@ func (cmd *CmdServer) Run() error {
 		maxConns: math.MaxInt,
 	}
 	il := &Listener[*IncomingHandler]{
-		port: 14600,
+		port: cmd.IncomingPort,
 		handler: &IncomingHandler{
 			handshakeReqC: handshakeReqC,
 			handshakeResC: handshakeResC,
@@ -134,8 +145,24 @@ func (cmd *CmdServer) Run() error {
 	return nil
 }
 
-func InitProxyConnection(ctx context.Context) error {
-	socket, err := Dial(ctx, "172.17.0.3:22000", true)
+func InitProxyConnection(ctx context.Context, proxyAddress, incomingAddress, targetAddress string) error {
+	proxyAddr, err := net.ResolveTCPAddr("tcp", proxyAddress)
+	if err != nil {
+		return fmt.Errorf("failed to resolve proxy address: %w", err)
+	}
+	ctx = CtxWithAttr(ctx, slog.String("proxy_address", proxyAddress))
+	incomingAddr, err := net.ResolveTCPAddr("tcp", incomingAddress)
+	if err != nil {
+		return fmt.Errorf("failed to resolve incoming address: %w", err)
+	}
+	ctx = CtxWithAttr(ctx, slog.String("incoming_address", incomingAddress))
+	targetAddr, err := net.ResolveTCPAddr("tcp", targetAddress)
+	if err != nil {
+		return fmt.Errorf("failed to resolve target address: %w", err)
+	}
+	ctx = CtxWithAttr(ctx, slog.String("target_address", targetAddress))
+
+	socket, err := Dial(ctx, proxyAddr, true)
 	if err != nil {
 		return fmt.Errorf("failed to dial to proxy: %w", err)
 	}
@@ -187,22 +214,26 @@ func InitProxyConnection(ctx context.Context) error {
 			}
 		case Connect:
 			slog.DebugContext(ctx, "init incoming connection", "conn_id", req.connID)
-			group.Go(func() error { return InitIncomingConnection(ctx, req.connID) })
+			group.Go(func() error {
+				return InitIncomingConnection(ctx,
+					req.connID, incomingAddr, targetAddr)
+			})
 		default:
 			slog.DebugContext(ctx, "rpc request method from proxy is not connect, skip it", "method", req.method)
 		}
 	}
 }
 
-func InitIncomingConnection(ctx context.Context, connID ConnID) error {
+func InitIncomingConnection(ctx context.Context, connID ConnID, incomingAddress, targetAddress *net.TCPAddr) error {
 	ctx = CtxWithAttr(ctx, slog.String("conn_id", connID.String()))
 	slog.DebugContext(ctx, "proxy requested new connection")
 
-	incomingSocket, err := Dial(ctx, "172.17.0.3:32345", false)
+	incomingSocket, err := Dial(ctx, incomingAddress, false)
 	if err != nil {
 		return fmt.Errorf("failed to dial incoming: %w", err)
 	}
 	defer func() {
+		slog.DebugContext(ctx, "close incoming socket")
 		if err = syscall.Close(incomingSocket); err != nil {
 			slog.ErrorContext(ctx, "failed to close incoming socket", "error", err)
 		}
@@ -218,11 +249,12 @@ func InitIncomingConnection(ctx context.Context, connID ConnID) error {
 		return fmt.Errorf("failed to write to incoming rpc request: %w", err)
 	}
 
-	targetSocket, err := Dial(ctx, "172.17.0.2:44000", false)
+	targetSocket, err := Dial(ctx, targetAddress, false)
 	if err != nil {
 		return fmt.Errorf("failed to dial target: %w", err)
 	}
 	defer func() {
+		slog.DebugContext(ctx, "close target socket")
 		if err = syscall.Close(targetSocket); err != nil {
 			slog.ErrorContext(ctx, "failed to close target socket", "error", err)
 		}
@@ -291,9 +323,13 @@ func (l *Listener[T]) Listen(ctx context.Context, nonblock bool) error {
 				return fmt.Errorf("failed to set fd as nonblock: %w", err)
 			}
 		}
+
 		ok := group.TryGo(InitListenerHandler(ctx, fd, addr, l.handler))
 		if !ok {
 			slog.WarnContext(ctx, "cannot init new connection because of goroutines limit")
+			if err = syscall.Close(fd); err != nil {
+				slog.ErrorContext(ctx, "failed to close fd", "error", err)
+			}
 			continue
 		}
 	}
@@ -595,18 +631,13 @@ func ShutdownSocket[T int | uintptr](ctx context.Context, fd T) {
 	}
 }
 
-func Dial(ctx context.Context, address string, nonblocking bool) (int, error) {
-	ctx = CtxWithAttr(ctx, slog.String("address", address))
-	addr, err := net.ResolveTCPAddr("tcp", address)
-	if err != nil {
-		return 0, fmt.Errorf("failed to resolve tcp address: %w", err)
-	}
+func Dial(ctx context.Context, address *net.TCPAddr, nonblocking bool) (int, error) {
 	socket, err := CreateSocket(nonblocking)
 	if err != nil {
 		return 0, fmt.Errorf("failed to init socket: %w", err)
 	}
-	sockaddr := syscall.SockaddrInet4{Port: addr.Port}
-	copy(sockaddr.Addr[:], addr.IP.To4())
+	sockaddr := syscall.SockaddrInet4{Port: address.Port}
+	copy(sockaddr.Addr[:], address.IP.To4())
 	slog.InfoContext(ctx, "starting to connect to socket")
 	for {
 		err = syscall.Connect(socket, &sockaddr)
@@ -653,8 +684,6 @@ func RandomConnID() ConnID {
 	return buf
 }
 
-const RPCMethodSize = 1
-
 type RPCMethod uint8
 
 const (
@@ -664,6 +693,22 @@ const (
 	Ack
 )
 
+func (m RPCMethod) String() string {
+	switch m {
+	case Ping:
+		return "ping"
+	case Pong:
+		return "pong"
+	case Connect:
+		return "connect"
+	case Ack:
+		return "ack"
+	default:
+		return "unknown"
+	}
+}
+
+const RPCMethodSize = 1
 const RPCRequestSize = RPCMethodSize + ConnIDSize
 
 var ErrSerialization = errors.New("serialization error")
@@ -696,19 +741,7 @@ func (r *RPCRequest) Decode(buf []byte) error {
 }
 
 func (r *RPCRequest) String() string {
-	method := ""
-	switch r.method {
-	case Ping:
-		method = "ping"
-	case Pong:
-		method = "pong"
-	case Connect:
-		method = "connect"
-	case Ack:
-		method = "ack"
-	default:
-		method = "unknown"
-	}
+	method := r.method.String()
 	connID := r.connID.String()
 	if connID == "" {
 		return fmt.Sprintf("method:%s", method)

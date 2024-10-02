@@ -27,7 +27,7 @@ run_docker_server:
 	docker run --rm -it \
 		--name ttun-server \
 		-p 14600:14600 \
-  	ttun --json server
+  	ttun --json-logs server
 
 curl_download_bytes:
 	mkdir -p $(curl_data_folder)
