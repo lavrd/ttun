@@ -21,7 +21,9 @@ Commands:
 Run "ttun <command> --help" for more information on a command.
 ```
 
-Docker should be up and running.
+### Demo with mock server
+
+Docker should be up and running before executing commands below.
 
 ```shell
 # Run server with mock data.
@@ -32,11 +34,15 @@ make build_docker
 make run_docker_server
 # Run client.
 make run_docker_client
+# Run Caddy.
+make run_caddy
 # Try to download some data through tunnel.
 make curl_download_bytes
 # Or.
 make curl_download_image
-# You can find downloaded files in curl-test-data folder.
+# You can find downloaded files in ./test-data folder.
 ```
 
 To make this demo working automatically you should stop all containers before starting it.
+
+Why we need Caddy? - as ttun doesn't support HTTPS and we want to use Caddy for it.
