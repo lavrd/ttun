@@ -1,4 +1,4 @@
-FROM nginx:1.27.4-alpine3.21
+FROM nginx:1.29.4-alpine3.23
 
 RUN rm -rf /etc/nginx/conf.d/default.conf
 COPY nginx.conf /etc/nginx/conf.d/default.conf
