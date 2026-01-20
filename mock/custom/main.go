@@ -51,6 +51,7 @@ func (cmd *CmdServer) Run() error {
 	http.Handle("/health", loggerMiddleware.Handler(http.HandlerFunc(healthHandler)))
 	http.Handle("/data/", loggerMiddleware.Handler(http.StripPrefix("/data", http.FileServer(http.Dir("/data")))))
 	slog.Info("starting http server")
+	//nolint:gosec // G114: ok
 	if err := http.ListenAndServe("0.0.0.0:44000", nil); err != nil {
 		return fmt.Errorf("failed to listen and serve: %w", err)
 	}

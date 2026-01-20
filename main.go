@@ -2,18 +2,14 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"log"
 	"log/slog"
 	"math"
 	"math/rand"
 	"net"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 
@@ -28,10 +24,9 @@ func main() {
 	kctx := kong.Parse(cmd)
 
 	slogHandler := NewSlogHandler(
-		os.Stdout,
 		&slog.HandlerOptions{
-			Level:     slog.LevelDebug,
 			AddSource: true,
+			Level:     slog.LevelDebug,
 		},
 		cmd.JsonLogs,
 	)
@@ -820,48 +815,37 @@ const CtxKeySlogFields CtxKey = "slog_fields"
 
 func CtxWithAttr(ctx context.Context, attr slog.Attr) context.Context {
 	if ctx == nil {
-		slog.WarnContext(ctx, "context is nil when try to add attributes")
+		slog.Warn("context is nil when try to add attributes")
 		ctx = context.Background()
 	}
 	if attrs, ok := ctx.Value(CtxKeySlogFields).([]slog.Attr); ok {
 		attrs = append(attrs, attr)
 		return context.WithValue(ctx, CtxKeySlogFields, attrs)
 	}
-	var attrs []slog.Attr
+	attrs := make([]slog.Attr, 0, 1)
 	attrs = append(attrs, attr)
 	return context.WithValue(ctx, CtxKeySlogFields, attrs)
 }
 
-type LogEvent struct {
-	Time    string            `json:"time"`
-	Level   string            `json:"level"`
-	Message string            `json:"message"`
-	Data    map[string]string `json:"data"`
-}
-
 type SlogHandler struct {
 	slog.Handler
-	attrs   []slog.Attr
-	printer LogPrinter
+	attrs []slog.Attr
 }
 
 func NewSlogHandler(
-	out io.Writer,
 	opts *slog.HandlerOptions,
 	jsonLogs bool,
 ) *SlogHandler {
 
-	logger := log.New(out, "", 0)
-
-	var printer LogPrinter = &LogPrinterText{l: logger}
+	var handler slog.Handler
 	if jsonLogs {
-		printer = &LogPrinterJson{l: logger}
+		handler = slog.NewJSONHandler(os.Stdout, opts)
+	} else {
+		handler = slog.NewTextHandler(os.Stdout, opts)
 	}
-
 	return &SlogHandler{
-		Handler: slog.NewTextHandler(out, opts),
+		Handler: handler,
 		attrs:   make([]slog.Attr, 0),
-		printer: printer,
 	}
 }
 
@@ -874,71 +858,5 @@ func (h *SlogHandler) Handle(ctx context.Context, r slog.Record) error {
 	for _, v := range h.attrs {
 		r.AddAttrs(v)
 	}
-	return h.printer.Print(r)
-}
-
-func (h *SlogHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
-	slogAttrs := h.attrs
-	slogAttrs = append(slogAttrs, attrs...)
-	return &SlogHandler{
-		Handler: h.Handler,
-		attrs:   slogAttrs,
-		printer: h.printer,
-	}
-}
-
-type LogPrinter interface {
-	Print(r slog.Record) error
-}
-
-type LogPrinterText struct {
-	l *log.Logger
-}
-
-func (p *LogPrinterText) Print(r slog.Record) error {
-	attrs := []byte(" ")
-	r.Attrs(func(a slog.Attr) bool {
-		attrs = append(attrs, []byte(fmt.Sprintf(`%s="%v" `, a.Key, a.Value.String()))...)
-		return true
-	})
-	// If there are no attributes this byte array is empty.
-	if len(attrs) != 1 {
-		attrs = attrs[:len(attrs)-1] // remove last space
-	}
-	timeStr := r.Time.Format(time.RFC3339)
-	var level string
-	switch r.Level {
-	case slog.LevelDebug, slog.LevelError:
-		level = r.Level.String()
-	default:
-		// To make all levels aligned (column text alignment).
-		level = r.Level.String() + " "
-	}
-	level += " "
-	p.l.Println(timeStr, level, r.Message, string(attrs))
-	return nil
-}
-
-type LogPrinterJson struct {
-	l *log.Logger
-}
-
-func (p *LogPrinterJson) Print(r slog.Record) error {
-	attrs := make(map[string]string, r.NumAttrs())
-	r.Attrs(func(a slog.Attr) bool {
-		attrs[a.Key] = a.Value.String()
-		return true
-	})
-	logEvent := LogEvent{
-		Time:    r.Time.Format(time.RFC3339),
-		Level:   strings.ToLower(r.Level.String()),
-		Message: r.Message,
-		Data:    attrs,
-	}
-	buf, err := json.Marshal(logEvent)
-	if err != nil {
-		return fmt.Errorf("failed to marshal log event: %w", err)
-	}
-	p.l.Println(string(buf))
-	return nil
+	return h.Handler.Handle(ctx, r)
 }
