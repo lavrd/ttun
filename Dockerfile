@@ -1,4 +1,4 @@
-FROM golang:1.24.0-alpine3.21 AS builder
+FROM golang:1.25.6-alpine3.23 AS builder
 RUN apk add --no-cache build-base
 WORKDIR /ttun
 
@@ -11,6 +11,6 @@ ARG race
 RUN if [[ -z "$race" ]] ; then CGO_ENABLED=0 go build -o app ; else CGO_ENABLED=1 go build -o app -race ; fi
 
 
-FROM golang:1.24.0-alpine3.21 AS app
+FROM alpine:3.23 AS app
 COPY --from=builder /ttun/app /ttun/app
 ENTRYPOINT ["/ttun/app"]
