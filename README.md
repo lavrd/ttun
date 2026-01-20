@@ -25,24 +25,34 @@ Run "ttun <command> --help" for more information on a command.
 
 Docker should be up and running before executing commands below.
 
+To make this demo working automatically you should stop all containers before starting it.
+
 ```shell
 # Run server with mock data.
+# You can use custom server (Go).
 cd mock/custom && make run_docker
+# Or run Nginx to serve mock data.
+cd mock/nginx && make run_docker
+
 # Build docker image with client and server.
 make build_docker
+
 # Run server.
 make run_docker_server
 # Run client.
 make run_docker_client
-# Run Caddy.
+
+# Now we need to run reverse proxy.
+# You can use Caddy.
 make run_caddy
-# Try to download some data through tunnel.
+# Or Nginx.
+make run_nginx
+
+# So now we can try to download data through tunnel.
+# Raw bytes.
 make curl_download_bytes
-# Or.
+# Or image.
 make curl_download_image
+
 # You can find downloaded files in ./test-data folder.
 ```
-
-To make this demo working automatically you should stop all containers before starting it.
-
-Why we need Caddy? - as ttun doesn't support HTTPS and we can use Caddy for it.
