@@ -1,98 +1,109 @@
+version: "2"
 run:
   timeout: 10m
   allow-parallel-runners: true
   tests: true
-
-linters-settings:
-  errcheck:
-    check-type-assertions: true
-    check-blank: true
-    disable-default-exclusions: true
-  gocritic:
-    enabled-tags:
-      - diagnostic
-      - performance
-      - style
-      - experimental
-    disabled-checks:
-      - whyNoLint
-      - hugeParam
-      - unnecessaryBlock
-      - sloppyReassign
-  govet:
-    enable-all: true
-    disable:
-      - fieldalignment
-      - composites
-  lll:
-    line-length: 120
-  whitespace:
-    multi-if: true
-    multi-func: true
-  nolintlint:
-    require-explanation: true
-  goconst:
-    min-len: 2
-    min-occurrences: 2
-  misspell:
-    locale: US
-  revive:
-    rules:
-      - name: var-naming
-        disabled: true
-  stylecheck:
-    checks: ["all", "-ST1003"]
-  unused:
-    field-writes-are-uses: false
-    post-statements-are-reads: true
-    exported-fields-are-used: false
-    # Enable it manually to check for unused variables.
-    # We can't enable it permanentrly, because a lot of
-    # false-positive warning for interfaces.
-    #parameters-are-used: false
-    local-variables-are-used: false
-    generated-is-used: false
-
-issues:
-  exclude:
-    - "G101"
-    - "G404"
-    - "G114"
-  exclude-rules:
-    - path: (.+)_test.go
-      linters:
-        - err113
-
 linters:
+  default: none
   enable:
-    - goconst
-    - errcheck
-    - govet
-    - unconvert
-    - gosec
-    - gofmt
-    - goimports
-    - gocyclo
+    - copyloopvar
     - dupl
-    - misspell
-    - lll
-    - unused
-    - whitespace
-    - nolintlint
-    - godox
-    - typecheck
-    - ineffassign
-    - stylecheck
-    - gochecknoinits
+    - err113
+    - errcheck
     - gochecknoglobals
-    - staticcheck
+    - gochecknoinits
+    - goconst
     - gocritic
+    - gocyclo
+    - godox
+    - gosec
+    - govet
+    - ineffassign
+    - lll
+    - misspell
     - nakedret
-    - gosimple
+    - nolintlint
     - prealloc
     - revive
-    - err113
+    - staticcheck
+    - unconvert
     - unparam
-    - copyloopvar
-  disable-all: true
-  fast: false
+    - unused
+    - whitespace
+  settings:
+    gosec:
+      excludes:
+        - G602 # delete after fix: https://github.com/securego/gosec/issues/1250
+    errcheck:
+      check-type-assertions: true
+      check-blank: true
+    goconst:
+      min-len: 2
+      min-occurrences: 2
+    gocritic:
+      disabled-checks:
+        - whyNoLint
+        - hugeParam
+        - unnecessaryBlock
+        - sloppyReassign
+      enabled-tags:
+        - diagnostic
+        - performance
+        - style
+        - experimental
+    govet:
+      disable:
+        - fieldalignment
+        - composites
+      enable-all: true
+    lll:
+      line-length: 120
+    misspell:
+      locale: US
+    nolintlint:
+      require-explanation: true
+    revive:
+      rules:
+        - name: var-naming
+          disabled: true
+    staticcheck:
+      checks:
+        - all
+        - -ST1003
+    unused:
+      field-writes-are-uses: false
+      exported-fields-are-used: false
+      local-variables-are-used: false
+      generated-is-used: false
+    whitespace:
+      multi-if: true
+      multi-func: true
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      - linters:
+          - err113
+        path: (.+)_test.go
+      - path: (.+)\.go$
+        text: G101
+      - path: (.+)\.go$
+        text: G404
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
