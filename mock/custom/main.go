@@ -43,11 +43,14 @@ func (cmd *CmdGen) Run() error {
 type CmdServer struct{}
 
 func (cmd *CmdServer) Run() error {
-	logger := slog.Default()
-	loggerMiddleware := &LoggerMiddleware{logger: logger}
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+		AddSource: true,
+		Level:     slog.LevelDebug,
+	})))
+	loggerMiddleware := &LoggerMiddleware{}
 	http.Handle("/health", loggerMiddleware.Handler(http.HandlerFunc(healthHandler)))
 	http.Handle("/data/", loggerMiddleware.Handler(http.StripPrefix("/data", http.FileServer(http.Dir("/data")))))
-	logger.Info("starting http server")
+	slog.Info("starting http server")
 	if err := http.ListenAndServe("0.0.0.0:44000", nil); err != nil {
 		return fmt.Errorf("failed to listen and serve: %w", err)
 	}
@@ -62,13 +65,11 @@ func main() {
 	}
 }
 
-type LoggerMiddleware struct {
-	logger *slog.Logger
-}
+type LoggerMiddleware struct{}
 
 func (l *LoggerMiddleware) Handler(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		l.logger.Info("http request", "method", r.Method, "uri", r.RequestURI)
+		slog.Info("http request", "method", r.Method, "uri", r.RequestURI)
 		h.ServeHTTP(w, r)
 	})
 }
