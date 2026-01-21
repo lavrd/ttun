@@ -6,7 +6,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestSuccess(t *testing.T) {
+func Test_Success(t *testing.T) {
 	r := require.New(t)
 	testCases := []struct {
 		req RPCRequest
@@ -32,29 +32,27 @@ func TestSuccess(t *testing.T) {
 	}
 }
 
-func TestBufIsNil(t *testing.T) {
-	r := require.New(t)
-	req := RPCRequest{}
-	err := req.Decode(nil)
-	r.Error(err)
-	r.ErrorIs(err, ErrSerialization)
-	r.ErrorContains(err, "buf is nil")
-}
-
-func TestIncorrectBufLength(t *testing.T) {
-	r := require.New(t)
-	req := RPCRequest{}
-	err := req.Decode([]byte{0})
-	r.Error(err)
-	r.ErrorIs(err, ErrSerialization)
-	r.ErrorContains(err, "bad request size")
-}
-
-func TestMethodIsZero(t *testing.T) {
-	r := require.New(t)
-	req := RPCRequest{}
-	err := req.Decode([]byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0})
-	r.Error(err)
-	r.ErrorIs(err, ErrSerialization)
-	r.ErrorContains(err, "rpc method is zero")
+func Test_RequestDecoding(t *testing.T) {
+	testCases := []struct {
+		buf []byte
+		msg string
+	}{
+		// Buf is nil.
+		{nil, "buf is nil"},
+		// Incorrect buf length.
+		{[]byte{0}, "bad request size"},
+		// Method is zero.
+		{[]byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, "rpc method is zero"},
+	}
+	for i := range testCases {
+		tc := testCases[i]
+		t.Run("", func(t *testing.T) {
+			r := require.New(t)
+			req := RPCRequest{}
+			err := req.Decode(tc.buf)
+			r.Error(err)
+			r.ErrorIs(err, ErrSerialization)
+			r.ErrorContains(err, tc.msg)
+		})
+	}
 }
