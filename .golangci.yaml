@@ -31,9 +31,6 @@ linters:
     - unused
     - whitespace
   settings:
-    gosec:
-      excludes:
-        - G602 # delete after fix: https://github.com/securego/gosec/issues/1250
     errcheck:
       check-type-assertions: true
       check-blank: true
