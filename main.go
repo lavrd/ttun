@@ -58,9 +58,9 @@ func (cmd *CmdClient) Run() error {
 	errC := make(chan error)
 	defer close(errC)
 
-	interrupt := make(chan os.Signal, 1)
-	defer close(interrupt)
-	signal.Notify(interrupt, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
+	interruptC := make(chan os.Signal, 1)
+	defer close(interruptC)
+	signal.Notify(interruptC, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
 
 	go func() {
 		errC <- InitProxyConnection(ctx,
@@ -68,7 +68,7 @@ func (cmd *CmdClient) Run() error {
 	}()
 
 	select {
-	case sig := <-interrupt:
+	case sig := <-interruptC:
 		slog.DebugContext(ctx, "received os signal", "signal", sig.String())
 		// To close all goroutines and streams copying.
 		cancel()
@@ -131,9 +131,9 @@ func (cmd *CmdServer) Run() error {
 	go func() { errC <- pl.Listen(ctx, false) }()
 	go func() { errC <- il.Listen(ctx, false) }()
 
-	interrupt := make(chan os.Signal, 1)
-	defer close(interrupt)
-	signal.Notify(interrupt, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
+	interruptC := make(chan os.Signal, 1)
+	defer close(interruptC)
+	signal.Notify(interruptC, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
 
 	select {
 	case err := <-errC:
@@ -142,7 +142,7 @@ func (cmd *CmdServer) Run() error {
 		// As one listener is already stopped as we received an error from the channel.
 		// We need to wait only for two remaining listeners.
 		DrainErrC(ctx, errC, 2)
-	case sig := <-interrupt:
+	case sig := <-interruptC:
 		slog.DebugContext(ctx, "received os signal", "signal", sig.String())
 		cancel()
 		// We want to wait for all three listeners.
