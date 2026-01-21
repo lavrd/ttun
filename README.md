@@ -28,11 +28,14 @@ Docker should be up and running before executing commands below.
 To make this demo working automatically you should stop all containers before starting it.
 
 ```shell
+# Generate mock data.
+cd mock/custom && go run . gen
+
 # Run server with mock data.
 # You can use custom server (Go).
 cd mock/custom && make run_docker
 # Or run Nginx to serve mock data.
-cd mock/nginx && make run_docker
+cd mock/nginx && make build_docker && make run_docker
 
 # Build docker image with client and server.
 make build_docker
